@@ -1,0 +1,12 @@
+"nc_name","source_name","long_name","units","group","n_valid","min","max"
+"Rs_PBM_CABLE_POP_soilr_S3_mean_1960_2023","CABLE-POP_soilr_S3_mean_1960-2023","Soil respiration from PBM CABLE-POP_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",60276,0,2619.35009765625
+"Rs_PBM_CLASSIC_soilr_S3_mean_1960_2023","CLASSIC_soilr_S3_mean_1960-2023","Soil respiration from PBM CLASSIC_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",66668,0,3229.97265625
+"Rs_PBM_CLM6_0_soilr_S3_mean_1960_2023","CLM6.0_soilr_S3_mean_1960-2023","Soil respiration from PBM CLM6.0_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",98165,0,2501.9814453125
+"Rs_PBM_E3SM_soilr_S3_mean_1960_2023","E3SM_soilr_S3_mean_1960-2023","Soil respiration from PBM E3SM_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",98071,0,3263.60888671875
+"Rs_PBM_IBIS_soilr_S3_mean_1960_2023","IBIS_soilr_S3_mean_1960-2023","Soil respiration from PBM IBIS_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",58124,0,3636.32421875
+"Rs_PBM_iMAPLE_Soilr_S3_mean_1960_2023","iMAPLE_Soilr_S3_mean_1960-2023","Soil respiration from PBM iMAPLE_Soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",259200,-150.394836425781,2080.4423828125
+"Rs_PBM_ISAM_soilr_S3_mean_1960_2023","ISAM_soilr_S3_mean_1960-2023","Soil respiration from PBM ISAM_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",59146,0,2065.49047851562
+"Rs_PBM_JULES_soilr_S3_mean_1960_2023","JULES_soilr_S3_mean_1960-2023","Soil respiration from PBM JULES_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",67420,-7.97642998200988e-14,2660.31494140625
+"Rs_PBM_LPJmL_soilr_S3_mean_1960_2023","LPJmL_soilr_S3_mean_1960-2023","Soil respiration from PBM LPJmL_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",67420,0,3318.8271484375
+"Rs_PBM_visit_ut_soilr_S3_mean_1960_2023","visit-ut_soilr_S3_mean_1960-2023","Soil respiration from PBM visit-ut_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",58697,0.070154570043087,3051.91235351562
+"Rs_PBM_VISIT_soilr_S3_mean_1960_2023","VISIT_soilr_S3_mean_1960-2023","Soil respiration from PBM VISIT_soilr_S3_mean_1960-2023","g C m-2 yr-1","model_PBM",58697,0.116058148443699,2938.9580078125

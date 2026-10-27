@@ -1,0 +1,11 @@
+"nc_name","source_name","long_name","units","group","n_valid","min","max"
+"Rs_DDM_hash12_spatial_mean","hash12_spatial_mean","Soil respiration from DDM hash12_spatial_mean","g C m-2 yr-1","model_DDM",52501,154.368713378906,1644.79162597656
+"Rs_DDM_hash15_spatial_mean","hash15_spatial_mean","Soil respiration from DDM hash15_spatial_mean","g C m-2 yr-1","model_DDM",57048,0,1559.11047363281
+"Rs_DDM_Huang_spatial_mean","Huang_spatial_mean","Soil respiration from DDM Huang_spatial_mean","g C m-2 yr-1","model_DDM",259200,0,1614.13659667969
+"Rs_DDM_Lu_spatial_mean","Lu_spatial_mean","Soil respiration from DDM Lu_spatial_mean","g C m-2 yr-1","model_DDM",56174,0,1613.06213378906
+"Rs_DDM_raich02_spatial_mean","raich02_spatial_mean","Soil respiration from DDM raich02_spatial_mean","g C m-2 yr-1","model_DDM",92361,0,1861.26098632812
+"Rs_DDM_raich95_spatial_mean","raich95_spatial_mean","Soil respiration from DDM raich95_spatial_mean","g C m-2 yr-1","model_DDM",62184,3.16499996185303,1410.05004882812
+"Rs_DDM_stell_spatial_mean","stell_spatial_mean","Soil respiration from DDM stell_spatial_mean","g C m-2 yr-1","model_DDM",59885,146.464935302734,2705.26782226562
+"Rs_DDM_Tang_spatial_mean","Tang_spatial_mean","Soil respiration from DDM Tang_spatial_mean","g C m-2 yr-1","model_DDM",61605,144.863433837891,1490.56896972656
+"Rs_DDM_Warner_spatial_mean","Warner_spatial_mean","Soil respiration from DDM Warner_spatial_mean","g C m-2 yr-1","model_DDM",59940,95.1411514282227,2087.38842773438
+"Rs_DDM_Zhao_spatial_mean","Zhao_spatial_mean","Soil respiration from DDM Zhao_spatial_mean","g C m-2 yr-1","model_DDM",56412,0,3453.90771484375

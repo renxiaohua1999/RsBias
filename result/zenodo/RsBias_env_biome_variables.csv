@@ -1,0 +1,9 @@
+"nc_name","source_name","long_name","units","group","n_valid","min","max"
+"biome_code","biome_code","Biome / landcover type (1-10 code)","categorical","biome",56529,1,10
+"MAT","MAT","MAT global product","degC","env_factor",56529,-23.2288455963135,30.3854160308838
+"MAP","MAP","MAP global product","mm yr-1","env_factor",56529,0,7510.109375
+"LAI","LAI","LAI global product","m2 m-2","env_factor",56529,0,6.90000009536743
+"SOC","SOC","SOC global product","kg C m-2","env_factor",54957,0.200000002980232,361.299987792969
+"GPP","GPP","GPP global product","g C m-2 yr-1","env_factor",53138,-53.9752235412598,3637.61328125
+"AI","AI","AI global product","1","env_factor",56326,0,10
+"SWC","SWC","SWC global product","m3 m-3","env_factor",37019,-5.55111512312578e-17,0.67786169052124

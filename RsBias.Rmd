@@ -1,0 +1,2369 @@
+---
+title: "RsBias：合并与精简后的可复现分析"
+author: "Rxh"
+output:
+  html_document:
+    toc: true
+    self_contained: true
+---
+
+
+## 运行设置与原始数据
+
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
+                      error = FALSE, dev = "png", fig.path = "result/report_figures/")
+# GDAL 默认按内存比例分配块缓存；面向 21600 x 43200 的大栅格(例如 stell/Warner)会把缓存撑爆并使拉中失败。
+# 必须在加载 terra 之前限制缓存大小。
+Sys.setenv(GDAL_CACHEMAX = "256")
+required_packages <- c("terra", "sf", "dplyr", "tidyr", "tibble", "ggplot2",
+  "patchwork", "ggrepel", "rnaturalearth", "rnaturalearthdata", "readxl",
+  "ggpubr", "gghalves", "ggh4x", "ggtext", "gtable", "rstatix", "glmnet",
+  "ncdf4", "scales", "showtext", "rmarkdown", "knitr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace,
+                                              logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("Please install missing packages: ",
+                                  paste(missing_packages, collapse = ", "))
+invisible(lapply(c("terra", "sf", "tidyr", "tibble", "ggplot2", "patchwork",
+  "ggrepel", "rnaturalearth", "readxl", "ggpubr", "gghalves", "ggh4x",
+  "ggtext", "gtable", "grid", "rstatix", "glmnet", "scales", "dplyr"),
+  library, character.only = TRUE))
+showtext::showtext_auto(FALSE)
+set.seed(123)
+stopifnot(dir.exists("data"))
+dir.create("result", showWarnings = FALSE)
+exclude_models <- c("yang", "SDGVM", "JSBACH", "EDv3")
+biome_levels <- c("Tropical Forest", "Temperate Forest", "Boreal Forest",
+  "Grassland", "Shrubland", "Desert", "Savanna", "Cropland", "Tundra", "Others")
+biome_abbr <- setNames(c("Trf", "Tef", "Bof", "Gra", "Shr", "Des", "Sav", "Cro", "Tun", "Oth"), biome_levels)
+biome_order <- unname(biome_abbr)
+load_inputs <- function(file, objects) {
+  e <- new.env(parent = emptyenv())
+  loaded <- load(file, envir = e)
+  if (!all(objects %in% loaded)) stop("Missing objects in ", file)
+  for (nm in objects) assign(nm, e[[nm]], envir = parent.frame())
+}
+load_inputs("data/forxiaohua.Rdata", c("env_site", "sr_site_all", "sr_biome_all", "sr_glo_all"))
+load_inputs("data/site_biome_sr_for_xh.Rdata", "site_biome_sr_for_xh")
+load_inputs("data/srdb_v51.RData", "srdb_v51")
+world <- ne_countries(scale = "medium", returnclass = "sf")
+```
+
+
+## 全部图共用的外观设置
+
+边框、字体和刻度在这里统一设置。彩色数据标记保留原来的含义；数学标注中的 R² 和 p 统一正体。
+
+```{r figure-style}
+FIG_STYLE <- list(family = "Arial", ink = "black", border = 0.6, tick_line = 0.4,
+                  base = 11, tick = 10, dense_tick = 8, title = 12,
+                  legend = 10, strip = 11, tag = 14)
+
+# Keep the whole frame stroke inside its viewport. A normal element_rect is
+# centred on the viewport edge: clip="on" removes half, clip="off" does not.
+element_figure_frame <- function(...) {
+  el <- element_rect(...)
+  class(el) <- c("element_figure_frame", class(el))
+  el
+}
+element_grob.element_figure_frame <- function(element, fill = NULL, ...) {
+  lw <- element$linewidth
+  stroke <- unit(lw * ggplot2::.pt / 96, "inches")
+  rectGrob(width = unit(1, "npc") - stroke,
+           height = unit(1, "npc") - stroke,
+           gp = gpar(col = element$colour,
+                     fill = if (is.null(fill)) element$fill else fill,
+                     lwd = lw * ggplot2::.pt, lty = element$linetype))
+}
+registerS3method("element_grob", "element_figure_frame",
+                 element_grob.element_figure_frame, envir = asNamespace("ggplot2"))
+
+figure_theme <- function(dense = FALSE, border = TRUE) {
+  tick_size <- if (dense) FIG_STYLE$dense_tick else FIG_STYLE$tick
+  theme(
+    text = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                        face = "plain", size = FIG_STYLE$base),
+    panel.border = if (border)
+      element_figure_frame(colour = FIG_STYLE$ink, fill = NA, linewidth = FIG_STYLE$border)
+      else element_blank(),
+    # Only panel.border draws the frame: do not double it with axis.line.
+    axis.line = element_blank(), axis.line.x = element_blank(), axis.line.y = element_blank(),
+    axis.ticks = element_line(colour = FIG_STYLE$ink, linewidth = FIG_STYLE$tick_line),
+    axis.ticks.x = element_line(colour = FIG_STYLE$ink, linewidth = FIG_STYLE$tick_line),
+    axis.ticks.y = element_line(colour = FIG_STYLE$ink, linewidth = FIG_STYLE$tick_line),
+    axis.ticks.length = unit(2, "pt"),
+    axis.text = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                             face = "plain", size = tick_size),
+    axis.text.x = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                               face = "plain", size = tick_size),
+    axis.text.y = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                               face = "plain", size = tick_size),
+    axis.title = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                              face = "plain", size = FIG_STYLE$title),
+    axis.title.x = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                face = "plain", size = FIG_STYLE$title),
+    axis.title.y = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                face = "plain", size = FIG_STYLE$title),
+    legend.text = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                               face = "plain", size = FIG_STYLE$legend),
+    legend.title = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                face = "plain", size = FIG_STYLE$legend),
+    strip.text = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                              face = "bold", size = FIG_STYLE$strip),
+    strip.text.x = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                face = "bold", size = FIG_STYLE$strip),
+    strip.text.y = if (dense)
+      element_markdown(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                        face = "bold", size = 10, angle = -90)
+      else element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                          face = "bold", size = FIG_STYLE$strip),
+    strip.background = element_rect(colour = FIG_STYLE$ink, linewidth = FIG_STYLE$border),
+    plot.title = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                              face = "bold", size = FIG_STYLE$title),
+    plot.subtitle = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                 face = "plain", size = FIG_STYLE$legend),
+    plot.tag = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                            face = "bold", size = FIG_STYLE$tag)
+  )
+}
+# Text drawn as geometry (annotations/repelled labels) does not inherit theme(text).
+for (geom in c("text", "label", "text_repel", "label_repel")) {
+  update_geom_defaults(geom, list(family = FIG_STYLE$family, colour = FIG_STYLE$ink))
+}
+```
+
+## 站点分布（来自 _2.Rmd，V2）
+
+```{r site-map}
+lct_color <- c("#228B22","#ADFF2F","#9ACD32","#8080C0","#E1E100","#E0E0E0",
+               "#D2691E","#B8860B","#E8E8D0","#272727","#BB0011")
+
+biome_color <- lct_color[1:10]
+site_color  <- lct_color[11]
+
+map_biome_order <- c("Tropical Forest","Temperate Forest","Boreal Forest",
+                 "Grassland","Shrubland","Desert","Savanna",
+                 "Cropland","Tundra","Others")
+
+biome_grid <- env_site %>%
+  filter(type == "biome") %>%
+  distinct(x, y, biome) %>%
+  mutate(biome = factor(biome, levels = map_biome_order))
+
+site_points <- env_site %>%
+  filter(type == "site", var == "AI", !is.na(sr_srdb))
+
+p <- ggplot() +
+  geom_tile(data = biome_grid, aes(x = x, y = y, fill = biome)) +
+  scale_fill_manual(values = biome_color, name = "Landcover", drop = FALSE) +
+  geom_sf(data = world, fill = NA, color = "grey30", linewidth = 0.2, inherit.aes = FALSE) +
+  geom_point(data = site_points,
+             aes(x = x, y = y, size = n_sites),
+             shape = 21, fill = site_color, color = "black",
+             stroke = 0.4, alpha = 0.7) +
+  scale_size_binned(
+    name   = "N sites",
+    breaks = c(1, 5, 25, 50, 100, 500),      # 分档断点
+    range  = c(1, 8),                     # 最小点到最大点的实际大小范围
+    guide  = guide_bins(show.limits = TRUE, override.aes = list(fill = site_color, color = "black"))
+  ) +
+  coord_sf(xlim = c(-180, 180), ylim = c(-60, 90), expand = FALSE) +
+  scale_x_continuous(breaks = seq(-120, 120, 60)) +
+  scale_y_continuous(breaks = seq(-60, 60, 20)) +
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 13, base_family = "Arial") +
+  theme(
+    panel.grid = element_blank(),
+    panel.border = element_figure_frame(colour = "black", fill = NA, linewidth = FIG_STYLE$border),
+    axis.ticks = element_line(colour = "black", linewidth = 0.4),
+    axis.ticks.length = unit(2, "pt"),
+    axis.text = element_text(colour = "black", size = 11),
+    legend.position = "bottom",
+    legend.title = element_text(size = 13, face = "bold"),
+    legend.text = element_text(size = 11),
+    legend.key = element_blank(),
+    plot.margin = margin(5, 10, 5, 5)
+  ) +
+  guides(fill = guide_legend(override.aes = list(size = 4), nrow = 2, byrow = TRUE))
+
+p <- p + figure_theme()
+ggsave("result/site_distribution_map_V2.png", p, width = 11, height = 6.5, dpi = 600)
+```
+
+## 站点模拟与观测（来自 _2.Rmd，V3）
+
+```{r site-scatter}
+obs_mean <- sr_site_all %>%
+  filter(type == "site",
+         !model %in% c("yang", "SDGVM", "JSBACH", "EDv3")) %>%
+  group_by(biome) %>%
+  summarise(obs_mean = mean(sr_srdb, na.rm = TRUE), .groups = "drop")
+
+sim_mean <- site_biome_sr_for_xh %>%
+  filter(type == "site",
+         !model %in% c("yang", "SDGVM", "JSBACH", "EDv3")) %>%
+  group_by(mtype, biome) %>%
+  summarise(sim_mean = mean(sr, na.rm = TRUE), .groups = "drop")
+
+data_all <- sim_mean %>%
+  left_join(obs_mean, by = "biome") %>%
+  filter(!is.na(obs_mean) & !is.na(sim_mean)) %>%
+  mutate(mtype = factor(mtype, levels = c("Data Driven", "TRENDY")))
+
+data_all <- data_all %>%
+  mutate(mtype = recode(mtype,
+                        "Data Driven" = "DDMs",
+                        "TRENDY"     = "PBMs")) %>%
+  mutate(mtype = factor(mtype, levels = c("DDMs", "PBMs")))   # 保持顺序
+
+model_colors <- c("DDMs" = "#4DB6AC", "PBMs" = "#6A1B9A")
+
+stat_list <- lapply(split(data_all, data_all$mtype), function(d) {
+  fit       <- lm(sim_mean ~ obs_mean, data = d)
+  slope     <- coef(fit)[2]
+  intercept <- coef(fit)[1]
+  r2        <- summary(fit)$r.squared
+  p_val     <- summary(fit)$coefficients[2, 4]
+
+  sign_str <- ifelse(intercept >= 0, " + ", " - ")
+  eq_label <- paste0("y == ", round(slope, 2), " * x", sign_str, round(abs(intercept), 2))
+  r2_label <- paste0("plain(R)^2 == ", round(r2, 2))
+  p_label  <- if (p_val < 0.001) {
+    "plain(p) < 0.001"
+  } else if (p_val < 0.01) {
+    "plain(p) < 0.01"
+  } else if (p_val < 0.05) {
+    "plain(p) < 0.05"
+  } else {
+    paste0("plain(p) == ", round(p_val, 2))
+  }
+
+  data.frame(mtype = unique(d$mtype),
+             eq_label = eq_label, r2_label = r2_label, p_label = p_label,
+             x = -Inf, y = Inf)
+})
+label_df <- bind_rows(stat_list)
+label_df$mtype <- factor(label_df$mtype, levels = levels(data_all$mtype))
+
+xlab_expr <- expression("Observed site-level mean "*R[s]*" (g C m"^{-2}~"yr"^{-1}*")")
+ylab_expr <- expression("Simulated site-level mean "*R[s]*" (g C m"^{-2}~"yr"^{-1}*")")
+
+p <- ggplot(data_all, aes(x = obs_mean, y = sim_mean, color = mtype, fill = mtype)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed",
+              color = "black", linewidth = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.25, linewidth = 0.9) +
+  geom_point(size = 3) +
+  geom_text_repel(aes(label = biome), size = 3.5, family = FIG_STYLE$family,
+                   color = "black",
+                   segment.color = "grey40", segment.size = 0.4,
+                   min.segment.length = 0, max.overlaps = Inf,
+                   seed = 42, box.padding = 0.4) +
+  geom_text(data = label_df, aes(x = x, y = y, label = eq_label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 1.8,
+            size = 5, family = FIG_STYLE$family, color = "black", parse = TRUE) +
+  geom_text(data = label_df, aes(x = x, y = y, label = r2_label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 3.8,
+            size = 5, family = FIG_STYLE$family, color = "black", parse = TRUE) +
+  geom_text(data = label_df, aes(x = x, y = y, label = p_label),
+            inherit.aes = FALSE, hjust = -0.05, vjust = 5.8,
+            size = 5, family = FIG_STYLE$family, color = "black", parse = TRUE) +
+  scale_color_manual(values = model_colors, guide = "none") +
+  scale_fill_manual(values = model_colors, guide = "none") +
+  facet_wrap(~ mtype, scales = "free") +
+  labs(x = xlab_expr, y = ylab_expr) +
+  theme_classic(base_size = 13) +
+  theme(
+    aspect.ratio = 1,                 # 用 theme 控制面板为正方形，替代 coord_equal
+    strip.background = element_rect(fill = "grey85", color = "black", linewidth = FIG_STYLE$border),
+    strip.text  = element_text(face = "bold", size = 15, color = "black"),
+    axis.line   = element_blank(),
+    panel.border = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),
+    plot.margin = margin(5, 8, 5, 8)
+  )
+
+p <- p + figure_theme()
+ggsave("result/Rs_scatter_V3.png", p, width = 10, height = 5.5, dpi = 300)
+```
+
+## 全球栅格集合均值（保留原重采样、掩膜和单位换算）
+
+```{r spatial-means}
+template <- rast(xmin = -180, xmax = 180, ymin = -90, ymax = 90,
+                 resolution = 0.5, crs = "EPSG:4326")
+combined_mask <- rasterize(vect(world[world$continent != "Antarctica", ]),
+                           template, field = 1, background = NA)
+ensemble_mean <- function(folder, unit_factor = 1) {
+  files <- sort(list.files(folder, pattern = "\\.tif(f)?$", full.names = TRUE))
+  stopifnot(length(files) > 0)
+  layers <- lapply(files, function(f) {
+    r <- rast(f)
+    if (!same.crs(r, template)) r <- project(r, template, method = "bilinear")
+    r <- resample(r, template, method = "bilinear")
+    mask(r * unit_factor, combined_mask)
+  })
+  app(rast(layers), mean, na.rm = TRUE)
+}
+r_dd <- ensemble_mean("data/spatial_ddm")
+r_tr <- ensemble_mean("data/spatial_pbm", 3600 * 24 * 365 * 1000)
+```
+
+## 全球分布图与纬向剖面
+
+```{r global-maps}
+df_dd <- as.data.frame(r_dd, xy = TRUE, na.rm = TRUE)
+df_tr <- as.data.frame(r_tr, xy = TRUE, na.rm = TRUE)
+r_diff <- as.data.frame(r_tr - r_dd, xy = TRUE, na.rm = TRUE)
+
+colnames(df_dd) <- c("lon", "lat", "Rs")
+colnames(df_tr) <- c("lon", "lat", "Rs")
+colnames(r_diff) <- c("lon", "lat", "Rs")
+
+upper_limit <- quantile(c(df_dd$Rs, df_tr$Rs, r_diff$Rs), 0.99, na.rm = TRUE)
+
+plot_map <- function(df, title_text) {
+  ggplot(df, aes(lon, lat, fill = Rs)) +
+    geom_raster() +
+    scale_fill_viridis_c(
+      option = "D",
+      limits = c(0, upper_limit),
+      oob    = squish,
+      name   = expression(R[s]~(g~C~m^{-2}~yr^{-1}))
+    ) +
+    annotate("text",
+             x     = -172,
+             y     = -80,
+             label = title_text,
+             hjust = 0, vjust = 0.5,
+             size  = 4, fontface = "bold",
+             color = "black") +          # ← 改为黑色
+    coord_cartesian(xlim   = c(-180, 180),
+             ylim   = c(-90, 90),
+             expand = FALSE,
+             clip   = "off") +           # ← 关闭裁剪
+    scale_x_continuous(
+      breaks = seq(-180, 180, 60),
+      labels = function(x) paste0(abs(x), "\u00b0", ifelse(x < 0, "W", "E"))
+    ) +
+    scale_y_continuous(
+      breaks = seq(-90, 90, 30),
+      labels = function(y) paste0(abs(y), "\u00b0", ifelse(y < 0, "S", "N"))
+    ) +
+    labs(x = NULL, y = NULL) +
+    guides(
+      fill = guide_colorbar(
+        title.position = "top",
+        barwidth       = unit(4, "cm"),
+        barheight      = unit(0.2, "cm")
+      )
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      panel.grid        = element_blank(),   # ← 关键：去掉所有网格线
+      legend.position   = c(0.58, 0.13),
+      legend.direction  = "horizontal",
+      legend.title      = element_text(size = 10, hjust = 0.5, color = "black",
+                              margin = margin(b = 2)),  # ← 黑色
+      legend.text       = element_text(size = 8,  color = "black",
+                              margin = margin(t = 2)),               # ← 黑色
+      legend.background = element_rect(fill = NA, color = NA),
+      plot.title        = element_blank(),
+      panel.grid.minor  = element_blank(),
+      panel.background  = element_rect(fill = NA, color = NA),
+      panel.border      = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),
+      axis.text         = element_text(color = "black", size = 10),
+      axis.title        = element_blank()
+    )
+}
+
+p_dd <- plot_map(df_dd, "DDMs")
+
+p_tr <- plot_map(df_tr, "PBMs")
+
+df_dd$type <- "Data-driven"
+df_tr$type <- "TRENDY"
+df_all <- rbind(df_dd, df_tr)
+
+grad_lat <- df_all %>%
+  group_by(lat, type) %>%
+  summarise(mean_Rs = mean(Rs, na.rm = TRUE), .groups = "drop")
+
+p_lat <- ggplot(grad_lat, aes(x = lat, y = mean_Rs, color = type)) +
+  geom_line(linewidth = 1) +
+  coord_flip() +
+  scale_color_manual(values = c("Data-driven" = "#4DB6AC", "TRENDY" = "#6A1B9A"),
+  labels = c("Data-driven" = "DDMs", "TRENDY" = "PBMs")) +
+  scale_x_continuous(
+    breaks = seq(-90, 90, 30),
+    labels = function(x) paste0(abs(x), "\u00b0", ifelse(x < 0, "S", "N"))) +
+  theme_minimal(base_size = 12) +          # ← 换成和 plot_map 一样的 base
+  labs(
+    x = "Latitude", y = expression(R[s]~(g~C~m^{-2}~yr^{-1})),
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +          # ← 换成和 plot_map 一样的 base
+  theme(
+    plot.title        = element_text(hjust = 0.5, face = "bold"),
+    panel.grid        = element_blank(),   # ← 和 plot_map 一致：去掉网格
+    panel.background  = element_rect(fill = NA, color = NA),
+    panel.border      = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),  # ← 黑框
+    axis.text         = element_text(color = "black", size = 10),
+    legend.position   = c(0.65, 0.90),
+    legend.background = element_rect(fill = NA, color = NA)
+  )
+
+p_dd <- p_dd + figure_theme()
+p_tr <- p_tr + figure_theme()
+p_lat <- p_lat + figure_theme()
+p_glo_map_Rs <- ((p_dd / p_tr) | p_lat) +
+  plot_layout(widths = c(3, 1)) +
+  plot_annotation(tag_levels = "a") &
+  theme(
+  panel.grid        = element_blank(),   # ← 关键：去掉所有网格线
+  plot.tag          = element_text(size = 14, face = "bold"),
+  plot.margin = margin(t = 0, r = 5, b = 0, l = 0, unit = "pt"),
+  legend.background = element_rect(fill = NA, color = NA),
+  legend.text       = element_text(size = FIG_STYLE$legend)   # 只统一条目字号
+)
+
+ggsave("result/p_dd_tr.png", plot = p_glo_map_Rs, width = 8, height = 6, dpi = 300)
+```
+
+## 差异图与显著性标记
+
+```{r difference-panels}
+diff_mean_rast <- rast(file.path("data/for_xiaohua_diff_mean_rast.tif"))
+df_diff <- as.data.frame(diff_mean_rast, xy = TRUE, na.rm = TRUE)
+colnames(df_diff) <- c("lon", "lat", "Rs")
+
+diff_abs_max <- quantile(abs(df_diff$Rs), 0.99, na.rm = TRUE)
+diff_limit <- max(diff_abs_max, 100)   # 至少100，避免范围太小
+
+p_value_rast <- rast(file.path("data/for_xiaohua_p_value_rast.tif"))
+
+global(p_value_rast, range, na.rm = TRUE)
+
+if (!compareGeom(p_value_rast, diff_mean_rast, stopOnError = FALSE)) {
+  p_value_rast <- resample(p_value_rast, diff_mean_rast, method = "near")
+}
+
+sig_bin <- ifel(p_value_rast < 0.05, 1, 0)
+sig_bin <- mask(sig_bin, diff_mean_rast)
+
+fact    <- 4                       # 0.5° × 4 = 2° 的打点间距；点太密就调大
+sig_agg <- aggregate(sig_bin, fact = fact, fun = mean, na.rm = TRUE)
+sig_agg <- ifel(sig_agg >= 0.5, 1, NA)
+
+df_sig <- as.data.frame(sig_agg, xy = TRUE, na.rm = TRUE)
+colnames(df_sig) <- c("lon", "lat", "sig")
+nrow(df_sig)   # 建议控制在 800~2500；超了就把 fact 调大
+
+Y_NPC <- 0.10
+Y_DAT <- Y_NPC * 180 - 90        # = -72
+
+to_dat <- function(x_npc) x_npc * 360 - 180
+
+BAR_RIGHT <- 0.72                # ★ 色带整块的右边缘(npc)。调大 = 色带往右
+GAP       <- 8                   # ★ 色带右缘 → 点 的间隙(单位:经度°)。调小 = 靠得更近
+
+X_DOT <- to_dat(BAR_RIGHT) + GAP
+X_TXT <- X_DOT + 6               # 文字紧跟点后
+
+plot_diff_map <- function(df, df_sig = NULL) {
+
+  p <- ggplot(df, aes(lon, lat, fill = Rs)) +
+    geom_raster()
+
+  if (!is.null(df_sig)) {
+    p <- p +
+      geom_point(data = df_sig, aes(x = lon, y = lat),
+                 inherit.aes = FALSE,
+                 size = 0.6, stroke = 0, colour = "black", alpha = 0.85)
+  }
+
+  p +
+    scale_fill_gradient2(
+      low = "#4DB6AC", mid = "white", high = "#9C4DCC",
+      midpoint = 0,
+      limits = c(-diff_limit, diff_limit),
+      oob = scales::squish,
+      name = expression(Delta~R[s]~(g~C~m^{-2}~yr^{-1}))
+    ) +
+
+    annotate("text", x = -175, y = Y_DAT,
+             label = "bold(Delta * R[s] == PBMs - DDMs)",
+             parse = TRUE, hjust = 0, vjust = 0.5,
+             size = 5, colour = "black") +
+
+    annotate("point", x = X_DOT, y = Y_DAT,
+             shape = 16, size = 1.2, colour = "black") +
+    annotate("text",  x = X_TXT, y = Y_DAT, label = "p < 0.05",
+             hjust = 0, vjust = 0.5, size = 4, colour = "black") +
+
+    coord_cartesian(xlim = c(-180, 180), ylim = c(-90, 90),
+                    expand = FALSE, clip = "off") +
+    scale_x_continuous(breaks = seq(-180, 180, 60),
+                       labels = function(x) paste0(abs(x), "\u00b0", ifelse(x < 0, "W", "E"))) +
+    scale_y_continuous(breaks = seq(-90, 90, 30),
+                       labels = function(y) paste0(abs(y), "\u00b0", ifelse(y < 0, "S", "N"))) +
+    labs(x = NULL, y = NULL) +
+    guides(
+      fill = guide_colorbar(title.position = "top",
+                            barwidth = unit(4, "cm"), barheight = unit(0.4, "cm"))
+    ) +
+    theme_bw(base_size = 14) +
+    theme(
+      legend.position      = c(BAR_RIGHT, Y_NPC),   # ★
+      legend.justification = c(1, 0.5),             # ★ 改成“右边缘中点”对齐(原来是 c(0.5, 0.5))
+      legend.direction     = "horizontal",
+      legend.margin        = margin(0, 0, 0, 0),
+      legend.background    = element_rect(fill = NA, color = NA),
+      legend.title = element_text(size = 12, hjust = 0.5, color = "black",
+                                  margin = margin(b = 2)),
+      legend.text  = element_text(size = 12, color = "black", margin = margin(t = 2)),
+      plot.title = element_blank(),
+      panel.grid = element_blank(),
+      panel.background = element_rect(fill = "white"),
+      panel.border = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),
+      axis.text = element_text(color = "black", size = 10),
+      axis.title = element_blank()
+    )
+}
+
+p_diff_2 <- plot_diff_map(df_diff, df_sig)
+
+# 用 DDMs 和 PBMs 实际有值的纬度范围，以及每个纬度带的最小像元数
+lat_rng <- range(df_all$lat)     # df_all 在前一个 chunk 里已生成，范围和 p_lat 一致
+
+df_lat_diff <- df_diff %>%
+  group_by(lat) %>%
+  summarise(mean_val = mean(Rs, na.rm = TRUE),
+            n = n(), .groups = "drop") %>%
+  filter(lat >= lat_rng[1], lat <= lat_rng[2],
+         n >= 5)                 # 像元太少的纬度带不画，去掉尖刺
+
+
+# df_lat_diff <- df_diff %>%
+#   group_by(lat) %>%
+#   summarise(mean_val = mean(Rs, na.rm = TRUE), .groups = "drop")
+
+add_zero_crossings <- function(df, x = "lat", y = "mean_val") {
+  df <- df %>% arrange(.data[[x]])
+  n <- nrow(df)
+  result <- df[0, ]  # 空模板，保留列结构
+
+  for (i in seq_len(n)) {
+    result <- bind_rows(result, df[i, ])
+
+    if (i < n) {
+      y1 <- df[[y]][i]
+      y2 <- df[[y]][i + 1]
+
+      if (!is.na(y1) && !is.na(y2) && y1 != 0 && y2 != 0 && sign(y1) != sign(y2)) {
+        x1 <- df[[x]][i]
+        x2 <- df[[x]][i + 1]
+        x0 <- x1 + (0 - y1) * (x2 - x1) / (y2 - y1)  # 线性插值求零点纬度
+
+        cross_row <- df[i, ]
+        cross_row[[x]] <- x0
+        cross_row[[y]] <- 0
+        result <- bind_rows(result, cross_row)
+      }
+    }
+  }
+
+  result
+}
+df_seg <- add_zero_crossings(df_lat_diff)
+
+df_pos <- df_seg %>% mutate(y = ifelse(mean_val >= 0, mean_val, NA_real_))
+df_neg <- df_seg %>% mutate(y = ifelse(mean_val <= 0, mean_val, NA_real_))
+
+p_lat_diff_3 <- ggplot() +
+  geom_hline(yintercept = 0, linetype = "dashed",
+             color = "grey40", linewidth = 0.4) +
+  geom_line(data = df_neg, aes(lat, y, color = "DDMs_gt"), linewidth = 1) +
+  geom_line(data = df_pos, aes(lat, y, color = "PBMs_gt"), linewidth = 1) +
+  coord_flip() +
+  scale_color_manual(
+    values = c("DDMs_gt" = "#4DB6AC", "PBMs_gt" = "#6A1B9A"),
+    labels = c("DDMs_gt" = "DDMs > PBMs", "PBMs_gt" = "PBMs > DDMs"),
+    name = NULL
+  ) +
+  scale_x_continuous(
+    limits = c(-90, 90),                      # 关键：强制轴范围
+    breaks = seq(-90, 90, 30),
+    labels = function(x) paste0(abs(x), "\u00b0", ifelse(x < 0, "S", "N"))
+  ) +
+  labs(x = "Latitude",
+       y = expression(Delta~R[s]~(g~C~m^{-2}~yr^{-1}))) +
+  theme_bw(base_size = 14) +
+ theme(
+  panel.grid = element_blank(),
+  panel.border          = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),  # 👈 新增，和 d 一致
+  legend.position = c(0.5, 0.07),
+  panel.background      = element_rect(fill = "transparent", color = NA),
+  plot.background       = element_rect(fill = "transparent", color = NA),
+  legend.background     = element_rect(fill = "transparent", color = NA),
+  legend.box.background = element_rect(fill = "transparent", color = NA),
+  legend.key            = element_rect(fill = "transparent", color = NA)
+)
+```
+
+## 全球总量面板
+
+```{r global-estimates}
+sr_glo_all_noS4 <- sr_glo_all %>% filter(exp != "S4")
+
+Rs_Summary <- read_excel("data/Hashimoto_2023_CEE.xlsx", sheet = "Table 1")  # 替换为实际名称
+
+new_rows <- Rs_Summary %>%
+  select(model = Study,
+         year = Pub_Year,
+         value = `Rs（Pg C /yr）`) %>%
+  mutate(exp = "S4",
+         source = "Data driven",
+         area = NA) %>%   # area 列按需求留空
+  slice(-c(50, 51))   # 删除第50行和第51行
+
+sr_glo_DDMs_Rs <- new_rows[, colnames(sr_glo_all_noS4)]
+
+sr_glo_all_Rs <- bind_rows(sr_glo_all_noS4, sr_glo_DDMs_Rs)
+sr_stats_result <- sr_glo_all_Rs %>%
+  dplyr::filter(between(year, 1980, 2016), exp != "S4") %>%
+  group_by(model, exp, source) %>%
+  summarise(mean = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  bind_rows(
+    sr_glo_all_Rs %>% dplyr::filter(exp == "S4")
+  )%>%
+  dplyr::filter(!model %in% c("yang", "SDGVM", "JSBACH", "EDv3"))
+
+n_labels <- sr_stats_result %>%
+  filter(exp %in% c("S3", "S4")) %>%
+  mutate(plot_y = if_else(exp == "S3", mean, value)) %>%
+  group_by(exp) %>%
+  summarise(
+    n       = n(),
+    mean_val = mean(plot_y, na.rm = TRUE),
+    min_val  = min(plot_y, na.rm = TRUE),
+    max_val  = max(plot_y, na.rm = TRUE),
+    sd_val  = sd(plot_y, na.rm = TRUE),
+    plot_y   = max(plot_y, na.rm = TRUE) - 60   # 标注位置在最低点下方
+  )
+
+p_glo_Rs <- ggplot(
+  sr_stats_result %>%
+    filter(exp %in% c("S3", "S4")) %>%
+    mutate(plot_y = if_else(exp == "S3", mean, value)),
+  aes(x = exp, y = plot_y, fill = exp, color = exp)
+) +
+  geom_violin(trim = FALSE, alpha = 0.25, color = NA, width = 0.5) +
+  geom_boxplot(
+    width = 0.15,
+    outlier.shape = NA,
+    fill = NA,
+    color = "black",
+    linewidth = 0.9
+  ) +
+  geom_jitter(
+    width = 0.06,
+    size = 2.8,
+    alpha = 0.45
+  ) +
+  geom_text(                                          # ① 添加样本量标注
+    data = n_labels,
+    aes(label = paste0("n = ", n)),
+    color = "black",
+    size = 4
+  ) +
+stat_compare_means(
+  method  = "wilcox.test", family = FIG_STYLE$family,
+  aes(label = paste0("p = ", after_stat(p.format))),
+  label.x = 1.2,        # 横向位置,在两组中间
+  label.y = 120,        # ← 数值越大越往上,根据你的 y 轴范围调
+  size    = 4
+) +
+  scale_fill_manual(
+    values = c("S3" = "#6A1B9A", "S4" = "#4DB6AC"),
+    labels = c("S3" = "PBMs", "S4" = "DDMs")         # ② 图例标签
+  ) +
+  scale_color_manual(
+    values = c("S3" = "#6A1B9A", "S4" = "#4DB6AC"),
+    labels = c("S3" = "PBMs", "S4" = "DDMs")
+  ) +
+  scale_x_discrete(labels = c("S3" = "PBMs", "S4" = "DDMs")) +
+  theme_bw(base_size = 14) +
+  theme(
+    legend.position   = "none",
+    legend.title      = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid        = element_blank(),
+    panel.border      = element_figure_frame(color = "black", fill = NA, linewidth = FIG_STYLE$border),  # 👈 0.8 → 0.6
+    panel.background  = element_rect(fill = "white", color = NA),
+    plot.background   = element_rect(fill = "white", color = NA),
+    axis.text         = element_text(color = "black", size = 10),   # 👈 与 d 对齐
+    axis.ticks        = element_line(color = "black")
+  ) +
+  labs(
+    x = NULL,
+    y = expression(R[s] ~ "(" * Pg ~ C ~ yr^{-1} * ")")
+  )
+```
+
+## 生物群系总量及四面板合图
+
+```{r biome-bars}
+sr_biome_stats_mean <- sr_biome_all %>%
+  filter(between(year, 1980, 2016), !model %in% exclude_models) %>%
+  group_by(biome, model, exp) %>%
+  summarise(mean = mean(value, na.rm = TRUE), .groups = "drop")
+area_lookup_clean <- sr_biome_all %>%
+  group_by(model, biome) %>%
+  summarise(area = mean(area, na.rm = TRUE), .groups = "drop")
+
+plot_biome_exp <- function(data, var = "slope",
+                           biome_max,
+                           x_min = NA) {
+
+  biome_labels <- c(
+  "Tundra" = "Tun",
+  "Boreal Forest" = "Bof",
+  "Tropical Forest" = "Trf",
+  "Temperate Forest" = "Tef",
+  "Desert" = "Des",
+  "Shrubland" = "Shr",
+  "Grassland" = "Gra",
+  "Savanna" = "Sav",
+  "Cropland" = "Cro",
+  "Others" = "Oth"
+)
+  var <- sym(var)
+
+  x_min <- if (is.na(x_min)) -biome_max / 5 else x_min
+
+  axis_titles <- switch(as.character(var),
+    "slope" = expression(R[s]~slope~"("*Pg~C~yr^{-2}*")"),
+    "mean"  = expression(R[s]~"("*Pg~C~yr^{-1}*")"),
+    paste(as.character(var))
+  )
+
+  fmt <- function(x) {
+    ifelse(x == as.integer(x),
+           as.character(as.integer(x)),
+           format(round(x, 3), nsmall = 2))
+  }
+
+  mean_biome_exp <- data %>%
+    filter(exp %in% c("S3", "S4")) %>%
+    group_by(biome, exp) %>%
+    summarise(value = mean(!!var, na.rm = TRUE), .groups = "drop")
+
+  plot_df <- mean_biome_exp %>%
+    mutate(
+      biome    = factor(biome, levels = levels(data$biome)),
+      row_type = factor(ifelse(exp == "S4", "S4", "TRENDY"),
+                        levels = c("TRENDY", "S4")),
+      y_id     = interaction(biome, row_type, sep = " | ", lex.order = TRUE),
+      exp      = factor(exp, levels = c("S3", "S4"))
+    ) %>%
+    mutate(y_id = factor(y_id, levels = rev(levels(y_id))))
+
+  plot_df <- plot_df %>%
+    mutate(
+      plot_value = value,
+      value_pos  = ifelse(plot_value > 0, plot_value, 0),
+      value_neg  = ifelse(plot_value < 0, plot_value, 0)
+    )
+
+  fill_map <- c("S3" = "#440154", "S4" = "#4DB6AC")
+
+  box_df <- plot_df %>%
+  distinct(biome, y_id) %>%
+  mutate(y_num = as.numeric(y_id)) %>%
+  group_by(biome) %>%
+  summarise(ymin = min(y_num) - 0.5,
+            ymax = max(y_num) + 0.5,
+            .groups = "drop") %>%
+  mutate(y_mid = (ymin + ymax) / 2,
+         biome_lab = unname(biome_labels[as.character(biome)]),
+         biome_lab = ifelse(is.na(biome_lab), as.character(biome), biome_lab))
+
+  sig_df <- data %>%
+    filter(exp %in% c("S3", "S4")) %>%
+    group_by(biome) %>%
+    summarise(
+      p_val = tryCatch(
+        wilcox.test((!!var)[exp=="S3"],
+                    (!!var)[exp=="S4"],
+                    exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      ),
+      .groups = "drop"
+    ) %>%
+    mutate(sig_label = case_when(
+      is.na(p_val) ~ "",
+      p_val < 0.001 ~ "***",
+      p_val < 0.01  ~ "**",
+      p_val < 0.05  ~ "*",
+      TRUE          ~ "ns"
+    )) %>%
+    left_join(box_df %>% select(biome, y_mid), by = "biome")
+
+  global_exp <- mean_biome_exp %>%
+    group_by(exp) %>%
+    summarise(global_val = sum(value, na.rm = TRUE), .groups = "drop")
+
+  pct_df <- mean_biome_exp %>%
+    left_join(global_exp, by = "exp") %>%
+    mutate(
+      pct_label  = sprintf("%.0f%%", value / global_val * 100),
+      text_color = fill_map[as.character(exp)]
+    ) %>%
+    left_join(plot_df %>% select(biome, exp, y_id),
+              by = c("biome", "exp"))
+
+  biome_x <- x_min * 0.75
+  sig_x   <- x_min * 0.1
+  pct_x   <- biome_max * 1.0
+
+  ggplot() +
+
+    geom_rect(data = box_df,
+              aes(xmin = -Inf, xmax = Inf,
+                  ymin = ymin, ymax = ymax),
+              fill = NA, colour = "black", linewidth = FIG_STYLE$border) +
+
+    geom_col(data = plot_df,
+             aes(x = value_pos, y = y_id, fill = exp),
+             width = 0.65) +
+
+    geom_col(data = plot_df,
+             aes(x = value_neg, y = y_id, fill = exp),
+             width = 0.65) +
+
+    geom_vline(xintercept = 0, linewidth = 0.5) +
+
+    geom_text(data = box_df,
+              aes(y = y_mid, label = biome_lab),
+              x = biome_x, hjust = 1, size = 3.5) +
+
+    geom_text(data = sig_df,
+              aes(x = sig_x, y = y_mid, label = sig_label),
+              hjust = 1, size = 4, fontface = "bold") +
+
+    geom_text(data = pct_df,
+              aes(x = pct_x, y = y_id,
+                  label = pct_label,
+                  color = text_color),
+              hjust = 1, size = 3) +
+
+    scale_color_identity() +
+
+    scale_fill_manual(values = fill_map,
+                      breaks = c("S4", "S3"),          # 控制图例显示顺序
+                      labels = c("S3" = "PBMs",
+                                 "S4" = "DDMs")) +
+
+    scale_x_continuous(
+      name   = axis_titles,
+      limits = c(x_min, biome_max),
+      breaks = c(x_min, pretty(c(0, biome_max), n = 5)),
+      labels = function(x) ifelse(x < 0, "", fmt(x))  # ← 左侧无刻度标签
+    ) +
+
+    scale_y_discrete(labels = NULL) +
+
+    labs(fill = NULL) +
+
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      panel.border = element_blank(),
+
+      axis.ticks.y = element_blank(),
+      axis.line.y  = element_blank(),
+      axis.title.y = element_blank(),
+
+      plot.margin = margin(10, 10, 10, 10),
+
+      axis.text.x = element_text(size = 10),
+      axis.title.x = element_text(face = "bold", size = 12),
+      legend.position = c(0.7, 0.5),
+      legend.direction = "vertical",
+      legend.key.size  = unit(0.5, "cm"),    # ← 控制色块大小
+      legend.spacing.y = unit(0.2, "cm"),    # ← 两项之间的垂直间距(可选)
+      legend.text = element_text(size = 10)
+    ) +
+
+    coord_cartesian(clip = "off")
+}
+p_biome_mean <- plot_biome_exp(sr_biome_stats_mean, var="mean", biome_max=25)
+
+layout_design <- "
+  ABBB
+  CDDD
+"
+p_glo_Rs <- p_glo_Rs + figure_theme()
+p_lat_diff_3 <- p_lat_diff_3 + figure_theme()
+p_diff_2 <- p_diff_2 + figure_theme()
+# The biome rows already have manually drawn boxes; avoid a second outer frame.
+p_biome_mean <- p_biome_mean + figure_theme(border = FALSE) +
+  theme(axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+        axis.title.y = element_blank())
+final_plot_matrix <- p_glo_Rs + p_biome_mean + p_lat_diff_3 + p_diff_2 +
+  plot_layout(design = layout_design) +
+  plot_annotation(tag_levels = list(c("a", "b", "c", "d"))) & # 👈 注意：这里改用 & 符号
+  theme(
+    plot.margin = margin(t = 0, r = 5, b = 0, l = 0, unit = "pt"),
+    plot.tag = element_text(face = "bold", size = 14)
+  )
+
+ggsave("result/bar_4Figs_v7.png", final_plot_matrix, width = 9, height = 8, dpi = 300, bg = "white")
+```
+
+## 偏差校正与涌现约束的共同输入
+
+```{r bias-data}
+sr_site_filtered <- sr_site_all %>%
+  dplyr::filter(!model %in% c("yang", "SDGVM", "JSBACH", "EDv3")) %>%
+  filter(!is.na(type), !is.na(value), !is.na(mtype)) %>%
+  group_by(biome, mtype, type) %>%
+  mutate(
+    Q1 = quantile(value, 0.25),
+    Q3 = quantile(value, 0.75),
+    IQR = Q3 - Q1,
+    upper_whisker = Q3 + 1.5 * IQR,
+    lower_whisker = Q1 - 1.5 * IQR
+  ) %>%
+  filter(value <= upper_whisker & value >= lower_whisker) %>%
+  ungroup()
+```
+
+## 代表性偏差校正（5000 次嵌套 bootstrap）
+
+```{r bias-correction}
+exclude_models <- c("yang", "SDGVM", "JSBACH", "EDv3")
+n_biomes <- length(biome_order)
+
+rho_by_model <- sr_site_filtered %>%
+  filter(mtype == "TRENDY", !model %in% exclude_models, !is.na(value), !is.na(biome)) %>%
+  mutate(biome = factor(biome_abbr[as.character(biome)], levels = biome_order)) %>%
+  group_by(model, biome, type) %>%
+  summarise(sim = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = type, values_from = sim, names_prefix = "sim_") %>%
+  mutate(rho = sim_biome / sim_site) %>% filter(is.finite(rho)) %>%
+  select(model, biome, rho)
+valid_models <- rho_by_model %>% count(model) %>%
+  filter(n == n_biomes) %>% pull(model)
+rho_by_model <- rho_by_model %>% filter(model %in% valid_models)
+
+biome_area_table <- area_lookup_clean %>%
+  filter(model %in% valid_models) %>%
+  group_by(biome) %>% summarise(area_m2 = median(area), .groups = "drop") %>%
+  mutate(biome = factor(biome_abbr[as.character(biome)], levels = biome_order)) %>%
+  arrange(biome)
+
+site_obs_raw <- sr_site_filtered %>%
+  filter(type == "site", !is.na(sr_srdb), !is.na(biome))
+if ("cell_id" %in% names(site_obs_raw)) {
+  srdb_sites <- site_obs_raw %>%
+    distinct(cell_id, biome, sr_srdb) %>%
+    group_by(cell_id, biome) %>%
+    summarise(sr_srdb_cell = mean(sr_srdb), .groups = "drop")
+} else {
+  one_model  <- site_obs_raw$model[1]
+  srdb_sites <- site_obs_raw %>% filter(model == one_model) %>%
+    transmute(cell_id = row_number(), biome, sr_srdb_cell = sr_srdb)
+}
+srdb_sites <- srdb_sites %>%
+  mutate(biome = factor(biome_abbr[as.character(biome)], levels = biome_order))
+
+srdb_means <- srdb_sites %>% group_by(biome) %>%
+  summarise(mean_srdb = mean(sr_srdb_cell), .groups = "drop")
+biome_uncorr     <- srdb_means %>% left_join(biome_area_table, by = "biome")
+global_rs_uncorr <- sum(biome_uncorr$mean_srdb * biome_uncorr$area_m2) * 1e-15
+
+rho_diag <- rho_by_model %>% group_by(biome) %>%
+  summarise(ratio_PBM = mean(rho, na.rm = TRUE), n_models = n(), .groups = "drop")
+
+set.seed(123); n_mc <- 5000
+rho_sets   <- split(rho_by_model$rho,        as.character(rho_by_model$biome))
+obs_sets   <- split(srdb_sites$sr_srdb_cell, as.character(srdb_sites$biome))
+area_vec   <- setNames(biome_area_table$area_m2, as.character(biome_area_table$biome))
+biomes_use <- Reduce(intersect, list(names(rho_sets), names(obs_sets), names(area_vec)))
+
+corr_sample <- numeric(n_mc)
+for (i in seq_len(n_mc)) {
+  tot <- 0
+  for (b in biomes_use) {
+    rv <- rho_sets[[b]]; ov <- obs_sets[[b]]
+    rho_b <- rv[sample.int(length(rv), 1)]                               # one rho per biome
+    obs_b <- mean(ov[sample.int(length(ov), length(ov), replace = TRUE)])  # resample obs w/ replacement
+    tot   <- tot + obs_b * rho_b * area_vec[[b]] * 1e-15
+  }
+  corr_sample[i] <- tot
+}
+mc_results <- tibble(iter = seq_len(n_mc), global_rs_corr = corr_sample)
+mc_stats <- mc_results %>% summarise(
+  mean_val = mean(global_rs_corr), sd_val = sd(global_rs_corr),
+  ci_lo = quantile(global_rs_corr, 0.025), ci_hi = quantile(global_rs_corr, 0.975))
+
+biome_bias_ranked <- srdb_means %>%
+  left_join(rho_diag, by = "biome") %>% left_join(biome_area_table, by = "biome") %>%
+  mutate(bias_per_area   = mean_srdb * (ratio_PBM - 1),
+         bias_global_PgC = bias_per_area * area_m2 * 1e-15) %>%
+  arrange(desc(abs(bias_global_PgC)))
+
+cat("valid PBM models    :", length(valid_models), "->", paste(valid_models, collapse=", "), "\n")
+cat("sum(bar bias)       :", round(sum(biome_bias_ranked$bias_global_PgC), 3), "PgC/yr\n")
+cat("boot mean - baseline:", round(mc_stats$mean_val - global_rs_uncorr, 3), "PgC/yr\n")
+cat("uncorrected baseline:", round(global_rs_uncorr, 3), "PgC/yr\n")
+corr_col <- "#21908C"
+plot_bias <- biome_bias_ranked %>%
+  mutate(biome = factor(biome, levels = biome[order(abs(bias_global_PgC))]))
+
+p_bias <- ggplot(plot_bias, aes(x = bias_global_PgC, y = biome)) +
+  geom_vline(xintercept = 0, colour = "grey40", linewidth = .5) +
+  geom_col(width = .7, fill = "#21908C", colour = "black", linewidth = .3) +
+  geom_text(aes(label = sprintf("W=%.2f", ratio_PBM),
+                x = -sign(bias_global_PgC) * 0.05 * max(abs(bias_global_PgC))),
+            hjust = ifelse(plot_bias$bias_global_PgC > 0, 1, 0), size = 3) +
+  scale_x_continuous(expand = expansion(mult = c(.18, .18))) +
+  labs(x = expression(Propagated~biome~R[s]~bias~(Pg~C~yr^{-1})), y = "Biome type") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid = element_blank())
+```
+
+## 涌现约束及留一交叉验证
+
+```{r emergent-constraint}
+exclude_models <- c("yang", "SDGVM", "JSBACH", "EDv3")
+n_biomes <- length(biome_order)                          # biome 总数
+valid_models <- sr_site_filtered %>%
+  filter(mtype == "TRENDY", !model %in% exclude_models,   # 只要 TRENDY, 且不在剔除名单
+         type == "biome", !is.na(value), !is.na(biome)) %>%
+  distinct(model, biome) %>%                              # 每个(模型, biome)只留一条
+  count(model) %>%                                        # 数每个模型覆盖了几个 biome
+  filter(n == n_biomes) %>%                               # 只留覆盖全部 biome 的模型
+  pull(model)
+
+biome_area_table <- area_lookup_clean %>%
+  filter(model %in% valid_models) %>%
+  group_by(biome) %>%
+  summarise(area_m2 = median(area), .groups = "drop") %>%     # 同一 biome 各模型面积略有差异, 取中位数
+  mutate(biome = factor(biome_abbr[as.character(biome)], levels = biome_order)) %>%  # 全名换缩写
+  arrange(biome)
+total_area <- sum(biome_area_table$area_m2)                   # 全球陆地面积(把均值换算成总量时用)
+
+x_site <- sr_site_filtered %>%
+  filter(mtype == "TRENDY", model %in% valid_models, type == "site", !is.na(value)) %>%
+  group_by(model) %>%
+  summarise(x_site = mean(value), .groups = "drop")
+
+y_global <- sr_site_filtered %>%
+  filter(mtype == "TRENDY", model %in% valid_models, type == "biome", !is.na(value)) %>%
+  mutate(biome = factor(biome_abbr[as.character(biome)], levels = biome_order)) %>%
+  group_by(model, biome) %>%
+  summarise(bmean = mean(value), .groups = "drop") %>%         # 每个(模型, biome)的均值
+  left_join(biome_area_table, by = "biome") %>%
+  group_by(model) %>%
+  summarise(y_global = sum(bmean * area_m2) / sum(area_m2), .groups = "drop")  # 面积加权全球均值
+
+model_df <- inner_join(x_site, y_global, by = "model")
+
+fit <- lm(y_global ~ x_site, data = model_df)
+r2  <- summary(fit)$r.squared                 # 样本内 R^2(拟合优度)
+pv  <- summary(fit)$coefficients[2, 4]         # 斜率的 p 值
+cat(sprintf("涌现关系: slope=%.3f intercept=%.2f R2=%.3f p=%.2e (n=%d)\n",
+            coef(fit)[2], coef(fit)[1], r2, pv, nrow(model_df)))
+
+loo_pred <- vapply(seq_len(nrow(model_df)), function(j)
+  predict(lm(y_global ~ x_site, data = model_df[-j, ]),  # 用去掉第 j 行的数据拟合
+          newdata = model_df[j, ]),                      # 预测被留出的第 j 行
+  numeric(1))
+y_obs   <- model_df$y_global                             # 真实(模拟)全球均值
+pred_r2 <- 1 - sum((y_obs - loo_pred)^2) / sum((y_obs - mean(y_obs))^2)  # 预测 R^2(Q^2, 样本外)
+rmse    <- sqrt(mean((y_obs - loo_pred)^2))              # 均方根误差
+mae     <- mean(abs(y_obs - loo_pred))                   # 平均绝对误差
+cat(sprintf("LOO-CV: 预测R2=%.3f RMSE=%.1f MAE=%.1f (n=%d)\n", pred_r2, rmse, mae, nrow(model_df)))
+
+REF <- valid_models[1]
+obs_rs <- sr_site_filtered %>%
+  filter(model == REF, type == "site", !is.na(sr_srdb)) %>%
+  pull(sr_srdb)                                          # 每个观测一个值(不做 cell 平均)
+x_obs <- mean(obs_rs)                                    # 观测的站点均值
+cat(sprintf("SRDB 观测: n=%d 均值=%.1f\n", length(obs_rs), x_obs))
+
+set.seed(123); n_mc <- 5000
+ecf <- numeric(n_mc); xb_store <- numeric(n_mc)
+for (i in seq_len(n_mc)) {
+  a  <- mean(obs_rs[sample.int(length(obs_rs), length(obs_rs), replace = TRUE)])  # ① 重采样观测求均值 a
+  xb_store[i] <- a                                                                #    (存下来给关系图底部的边际)
+  pr <- predict(fit, data.frame(x_site = a), interval = "prediction", level = 0.95)  # ② a 代入 fit 得预测区间
+  se <- (pr[, "upr"] - pr[, "fit"]) / 1.96                                        #    由 95% 区间反推标准差
+  ecf[i] <- rnorm(1, pr[, "fit"], se)                                             # ③ 从(高斯)预测分布随机抽一个
+}
+ec_flux  <- ecf                       # 约束后全球均值 (g C m-2 yr-1), 用于图2/图3
+ec_total <- ecf * total_area * 1e-15  # 换算成全球总量 (Pg C yr-1), 用于图4
+prior_flux <- model_df$y_global       # 未约束: n 个模型的全球均值(集合先验)
+cat(sprintf("约束结果: %.1f g C m-2 yr-1 -> %.2f Pg C yr-1 (95%%CI %.2f-%.2f)\n",
+            mean(ec_flux), mean(ec_total), quantile(ec_total, .025), quantile(ec_total, .975)))
+
+PUR <- "#440154"; RED <- "#E8000B"; TEAL <- "#3AAFA9"; TEAL_D <- "#1F7A78"; MBLU <- "#3B8DD8"
+cen <- mean(ec_flux); lo <- quantile(ec_flux, .025); hi <- quantile(ec_flux, .975)
+```
+
+## 偏差校正和涌现约束组合图（V4）
+
+```{r bias-ec-figure}
+PUR <- "#440154"
+
+v1 <- mc_results$global_rs_corr      # 方法一:代表性偏差校正
+v2 <- ec_total                       # 方法二:涌现约束
+ADJ <- 2                             # 与你原来 p_density 的 adjust 一致
+
+d1 <- density(v1, adjust = ADJ); d2 <- density(v2, adjust = ADJ)
+dm <- max(d1$y, d2$y)
+
+mk_ci <- function(v, y) data.frame(
+  m  = mean(v), lo = quantile(v, .025), hi = quantile(v, .975), y = y,
+  lab = sprintf("%.1f (\u00b1%.1f)", mean(v), (quantile(v,.975)-quantile(v,.025))/2))
+ci1 <- mk_ci(v1, 0.18*dm)            # 方法一 CI 画高一点
+ci2 <- mk_ci(v2, 0.06*dm)            # 方法二 CI 画低一点
+th  <- 0.03*dm
+
+df <- rbind(data.frame(x = v1, method = "Bias correction"),
+            data.frame(x = v2, method = "Emergent constraint"))
+df$method <- factor(df$method,
+  levels = c("Bias correction", "Emergent constraint"))
+cols <- c("Bias correction" = corr_col,
+          "Emergent constraint"           = PUR)
+
+p_both <- ggplot(df, aes(x, fill = method, colour = method)) +
+  geom_density(alpha = .35, adjust = ADJ, linewidth = .8, position = "identity") +
+  geom_segment(data=ci1, aes(x=lo,xend=hi,y=y,yend=y),       inherit.aes=FALSE, colour=corr_col, linewidth=1.2) +
+  geom_segment(data=ci1, aes(x=lo,xend=lo,y=y-th,yend=y+th), inherit.aes=FALSE, colour=corr_col, linewidth=1.2) +
+  geom_segment(data=ci1, aes(x=hi,xend=hi,y=y-th,yend=y+th), inherit.aes=FALSE, colour=corr_col, linewidth=1.2) +
+  geom_point(  data=ci1, aes(x=m,y=y),                       inherit.aes=FALSE, colour=corr_col, size=4) +
+  geom_text(   data=ci1, aes(x=m,y=y,label=lab),             inherit.aes=FALSE, colour=corr_col, vjust=-1.4, fontface="bold", size=4.2) +
+  geom_segment(data=ci2, aes(x=lo,xend=hi,y=y,yend=y),       inherit.aes=FALSE, colour=PUR, linewidth=1.2) +
+  geom_segment(data=ci2, aes(x=lo,xend=lo,y=y-th,yend=y+th), inherit.aes=FALSE, colour=PUR, linewidth=1.2) +
+  geom_segment(data=ci2, aes(x=hi,xend=hi,y=y-th,yend=y+th), inherit.aes=FALSE, colour=PUR, linewidth=1.2) +
+  geom_point(  data=ci2, aes(x=m,y=y),                       inherit.aes=FALSE, colour=PUR, size=4) +
+  geom_text(   data=ci2, aes(x=m,y=y,label=lab),             inherit.aes=FALSE, colour=PUR, vjust=-1.4, fontface="bold", size=4.2) +
+  scale_fill_manual(values = cols, name = NULL) +
+  scale_colour_manual(values = cols, name = NULL) +
+  labs(x = expression("Global R"[s]~"(Pg C yr"^{-1}*")"), y = "Probability density") +
+  coord_cartesian(clip = "off") +
+  theme_bw(base_size = 12) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = c(0.01, 0.98),
+        legend.justification = c(0, 1),
+        legend.background = element_rect(fill = NA, colour = NA))
+set.seed(42)
+ND    <- 20000
+a     <- sample(v1, ND, replace = TRUE)    # Bias correction
+b     <- sample(v2, ND, replace = TRUE)    # Emergent constraint
+delta <- b - a                              # BC − EC
+
+d_mean <- mean(delta)
+d_ci   <- quantile(delta, c(.025, .975))
+p_two  <- 2 * min(mean(delta > 0), mean(delta < 0))    # bootstrap 双侧 p
+sig    <- !(d_ci[1] <= 0 && d_ci[2] >= 0)              # 95% CI 是否排除 0
+
+gr  <- seq(min(c(v1, v2)), max(c(v1, v2)), length.out = 2048)
+f1  <- approx(density(v1, adjust = ADJ), xout = gr)$y
+f2  <- approx(density(v2, adjust = ADJ), xout = gr)$y
+ovl <- sum(pmin(f1, f2, na.rm = TRUE)) * (gr[2] - gr[1])
+
+cat(sprintf("BC mean = %.2f | EC mean = %.2f\n", mean(v1), mean(v2)))
+cat(sprintf("Delta(EC-BC) = %.2f  95%%CI [%.2f, %.2f]  p = %.4f  overlap = %.2f  -> %s\n",
+            d_mean, d_ci[1], d_ci[2], p_two, ovl,
+            ifelse(sig, "significant", "not significant")))
+
+p_lab <- if (p_two < 0.001) {"p < 0.001"} else {sprintf("p = %.3f", p_two)}
+lab_diff <- sprintf("\u0394 = %.1f Pg C yr\u207B\u00B9\n95%% CI: [%.1f, %.1f]\n%s",
+                    d_mean,d_ci[1],d_ci[2], p_lab)
+
+p_both <- p_both +
+  annotate("text",
+           x = max(c(v1, v2)), y = 0.98 * dm,
+           label = lab_diff, hjust = 1, vjust = 1,
+           size = 3.8, lineheight = 0.95, colour = "black")
+
+p_bias <- p_bias + figure_theme()
+p_both <- p_both + figure_theme()
+combined <- p_bias + p_both +   # 即使前面去掉了也没关系
+  plot_layout(widths = c(0.8, 1)) +
+  plot_annotation(tag_levels = "a") &
+  theme(
+    panel.border = element_figure_frame(colour = "black", fill = NA, linewidth = FIG_STYLE$border),
+    panel.grid = element_blank(),    # Modified: remove all internal grids
+    axis.title = element_text(size = FIG_STYLE$title),
+    axis.text = element_text(size = FIG_STYLE$tick),
+    plot.tag = element_text(face = "bold", size = FIG_STYLE$tag)
+  )
+
+ggsave(filename = "result/Fig_bias_EC_combined_V4.png",
+       plot = combined, width = 10, height = 4.5,
+       dpi = 300, bg = "white")
+```
+
+## 涌现约束关系、交叉验证及约束前后密度（V2）
+
+```{r ec-validation-figure}
+PUR <- "#440154"; RED <- "red"; GRY <- "black"
+cen <- mean(ec_flux); lo <- quantile(ec_flux, .025); hi <- quantile(ec_flux, .975)
+gcurve <- function(v, n = 400){ m <- mean(v); s <- sd(v); xx <- seq(m-4*s, m+4*s, length.out = n)
+  data.frame(x = xx, y = dnorm(xx, m, s)) }
+xr <- range(model_df$x_site); yr <- range(c(model_df$y_global, lo, hi))
+xspan <- diff(xr); yspan <- diff(yr)
+xpad <- 0.06*xspan; ypad <- 0.08*yspan
+mB <- 0.16*yspan            # 底部边际带高
+mR <- 0.16*xspan            # 右侧边际带宽
+xlo <- xr[1]-xpad;  xhi <- xr[2]+xpad+mR
+ylo <- yr[1]-ypad-mB; yhi <- yr[2]+ypad
+gb <- gcurve(xb_store)      # 底部：观测均值分布（峰朝上）
+d_bot <- data.frame(x = gb$x, y = ylo + (gb$y/max(gb$y))*mB)
+gr <- gcurve(ec_flux)       # 右侧：约束后全球均值分布（峰朝左）
+d_rgt <- data.frame(y = gr$x, x = xhi - (gr$y/max(gr$y))*mR)
+xseg <- c(xlo, xr[2]+xpad)  # 回归线限制在主数据区，不进右边际带
+yseg <- coef(fit)[1] + coef(fit)[2]*xseg
+
+obs_lo <- as.numeric(quantile(xb_store, .025))
+obs_hi <- as.numeric(quantile(xb_store, .975))
+
+ec_lab  <- sprintf("EC = %.0f \u00B1 %.0f",  cen,   (hi - lo)/2)
+obs_lab <- sprintf("Obs = %.0f \u00B1 %.0f", x_obs, (obs_hi - obs_lo)/2)
+
+p_lab <- if (pv < 0.001) "p < 0.001" else sprintf("p = %.3f", pv)
+stats_lab <- sprintf("R\u00B2 = %.2f\n%s\nn = %d", r2, p_lab, nrow(model_df))
+
+p_rel <- ggplot(model_df, aes(x_site, y_global)) +
+  annotate("rect", xmin = xlo, xmax = xhi, ymin = lo, ymax = hi,
+           fill = RED, alpha = 0.10) +
+  annotate("rect", xmin = obs_lo, xmax = obs_hi, ymin = ylo, ymax = yhi,
+           fill = "grey50", alpha = 0.20) +
+  annotate("segment", x = xseg[1], xend = xseg[2], y = yseg[1], yend = yseg[2],
+           colour = PUR, linewidth = 1) +
+  geom_hline(yintercept = cen, colour = RED, linewidth = 0.9) +
+  geom_hline(yintercept = c(lo, hi), colour = RED, linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = c(obs_lo, obs_hi), colour = GRY, linetype = "dashed", linewidth = 0.5) +
+  geom_vline(xintercept = x_obs, colour = GRY, linewidth = 0.6) +
+  geom_line(data = d_bot, aes(x, y), inherit.aes = FALSE, colour = "grey45", linewidth = 0.7) +
+  geom_path(data = d_rgt, aes(x, y), inherit.aes = FALSE, colour = RED, linewidth = 0.7) +
+  geom_point(size = 2.8, colour = PUR) +
+  geom_point(aes(x_obs, cen), colour = RED, size = 3.6) +
+  geom_text_repel(aes(label = model), size = 3, colour = GRY, box.padding = 0.35,
+                  max.overlaps = Inf, segment.color = "grey60", segment.size = 0.25, seed = 1) +
+  annotate("label", x = xlo, y = yhi, label = stats_lab, hjust = 0, vjust = 1,
+           size = 4.0, label.size = 0.3, fill = "white", alpha = 0.85, lineheight = 0.95) +
+  annotate("label", x = xr[2] + xpad, y = cen, label = ec_lab,
+           hjust = 1, vjust = 0.5, size = 4.0, label.size = 0,
+           fill = RED, colour = "white", alpha = 0.90) +
+  annotate("label", x = x_obs, y = yhi, label = obs_lab,
+           hjust = 0.5, vjust = 1, size = 4.0, label.size = 0,
+           fill = "grey50", colour = "white", alpha = 0.90) +
+  coord_cartesian(xlim = c(xlo, xhi), ylim = c(ylo, 900), clip = "off") +
+  labs(x = expression("Site-level averaged R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
+       y = expression("Global averaged R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
+       title = "a  Emergent relationship", subtitle = "PBMs (TRENDY)") +
+  theme_bw(base_size = 14) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey30"))
+
+PUR <- "#440154"
+loo_df <- data.frame(obs = y_obs, pred = loo_pred, model = model_df$model)
+lm_val   <- lm(pred ~ obs, data = loo_df)          # 验证回归（预测~真实）
+slope_v  <- coef(lm_val)[["obs"]]
+intcpt_v <- coef(lm_val)[["(Intercept)"]]
+bias_v   <- mean(loo_df$pred - loo_df$obs)         # MBE = mean(pred - obs)
+val_lab <- sprintf(
+  "Slope = %.2f\nIntercept = %.0f\nBias = %+.0f\nPredictive R\u00B2 = %.2f\nRMSE = %.0f\nn = %d",
+  slope_v, intcpt_v, bias_v, pred_r2, rmse, nrow(loo_df))
+rng <- range(c(loo_df$obs, loo_df$pred)); pad <- diff(rng)*0.10; lim <- c(rng[1]-pad, rng[2]+pad)
+
+p_val <- ggplot(loo_df, aes(obs, pred)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40", linewidth = 0.6) +
+  geom_abline(slope = slope_v, intercept = intcpt_v, colour = PUR, linewidth = 0.8) +
+  geom_point(size = 2.8, colour = PUR) +
+  geom_text_repel(aes(label = model), size = 3, box.padding = 0.35, max.overlaps = Inf,
+                  segment.color = "grey60", segment.size = 0.25, seed = 1) +
+  annotate("label", x = lim[1], y = lim[2], label = val_lab, hjust = 0, vjust = 1,
+           size = 3.1, label.size = 0.3, fill = "white", alpha = 0.85) +
+  coord_equal(xlim = lim, ylim = lim) +
+  labs(x = expression("Actual global average R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
+       y = expression("LOO predicted R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
+       title = "b  Leave-one-out cross-validation", subtitle = "PBMs (TRENDY)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey30"))
+PUR <- "#440154"; RED <- "red"
+mu0 <- mean(prior_flux); sd0 <- sd(prior_flux)     # 未约束（集合先验）
+mu1 <- mean(ec_flux);    sd1 <- sd(ec_flux)        # 约束后
+red_pct <- (1 - sd1/sd0)*100
+x_rng <- range(c(mu0-3.5*sd0, mu0+3.5*sd0, mu1-3.5*sd1, mu1+3.5*sd1))
+xx <- seq(x_rng[1], x_rng[2], length.out = 500)
+dens <- rbind(data.frame(x = xx, y = dnorm(xx, mu0, sd0), grp = "Unconstrained"),
+              data.frame(x = xx, y = dnorm(xx, mu1, sd1), grp = "Constrained"))
+dens$grp <- factor(dens$grp, levels = c("Unconstrained", "Constrained"))
+peak <- data.frame(grp = factor(c("Unconstrained","Constrained"),
+                                levels = c("Unconstrained","Constrained")),
+                   x = c(mu0, mu1),
+                   y = c(dnorm(mu0, mu0, sd0), dnorm(mu1, mu1, sd1)))
+inset_lab <- sprintf(
+  "Unconstrained = %.0f \u00B1 %.0f\nConstrained     = %.0f \u00B1 %.0f\nUncertainty reduction = %.0f%%",
+  mu0, sd0, mu1, sd1, red_pct)
+
+p_ba <- ggplot(dens, aes(x, y, colour = grp)) +
+  geom_line(linetype = "dotted", linewidth = 1) +
+  geom_text(data = peak, aes(x, y, label = grp, colour = grp),
+            vjust = -0.3, hjust = -0.3, # 右对齐
+            fontface = "bold", size = 3.6, show.legend = FALSE) +
+  annotate("label", x = x_rng[1], y = max(peak$y)*1.15, label = inset_lab,
+           hjust = 0.02, vjust = 0.55, size = 3.0, label.size = 0.3, fill = "white", alpha = 0.85) +
+  scale_colour_manual(values = c(Unconstrained = PUR, Constrained = RED)) +
+  coord_cartesian(xlim = x_rng, ylim = c(0, max(peak$y)*1.22)) +
+  labs(x = expression("Global average R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
+       y = "Probability density",
+       title = "c  Unconstrained vs. constrained", subtitle = "PBMs (TRENDY)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        plot.subtitle = element_text(color = "grey30"))
+
+layout <- "
+AA
+BC
+"
+p_rel <- p_rel + figure_theme()
+p_val <- p_val + figure_theme()
+p_ba <- p_ba + figure_theme()
+combined <- p_rel + p_val + p_ba  +
+  plot_layout(design = layout) &
+  theme(
+    panel.border = element_figure_frame(colour = "black", fill = NA, linewidth = FIG_STYLE$border),
+        panel.grid = element_blank(),    # Modified: remove all internal grids
+    axis.title = element_text(size = FIG_STYLE$title),
+    axis.text = element_text(size = FIG_STYLE$tick),
+    plot.tag = element_text(face = "bold", size = FIG_STYLE$tag)
+  )
+ggsave(filename = "result/Fig_rel_val_ba_V2.png",
+       plot = combined, width = 8, height = 10,
+       dpi = 300, bg = "white")
+```
+
+## 三组 V8 半提琴图（共用最终绘图函数）
+
+```{r violin-v8}
+env_site$biome <- factor(env_site$biome, levels = biome_levels)
+range_cfg <- list(
+  AI = list(
+    "Tropical Forest"  = c(0, 4),   "Temperate Forest" = c(0, 4),
+    "Boreal Forest"    = c(0, 2.5), "Grassland"        = c(0, 2.5),
+    "Shrubland"        = c(0, 2.5), "Desert"           = c(0, 1.5),
+    "Savanna"          = c(0, 2),   "Cropland"         = c(0, 2),
+    "Tundra"           = c(0, 3),   "Others"           = c(0, 3)
+  ),
+  Tair = list(
+    "Tropical Forest"  = c(10, 35),  "Temperate Forest" = c(-10, 35),
+    "Boreal Forest"    = c(-15, 20), "Grassland"        = c(-15, 35),
+    "Shrubland"        = c(-20, 35), "Desert"           = c(-20, 40),
+    "Savanna"          = c(-10, 35), "Cropland"         = c(-10, 35),
+    "Tundra"           = c(-25, 15), "Others"           = c(-30, 40)
+  ),
+  Pre = list(
+    "Tropical Forest"  = c(-100, 5000), "Temperate Forest" = c(-100, 3000),
+    "Boreal Forest"    = c(-100, 2000), "Grassland"        = c(-100, 2500),
+    "Shrubland"        = c(-100, 2500), "Desert"           = c(-100, 2000),
+    "Savanna"          = c(-100, 2500), "Cropland"         = c(-100, 3000),
+    "Tundra"           = c(-100, 2000), "Others"           = c(-100, 3000)
+  ),
+  GPP = list(
+    "Tropical Forest"  = c(-100, 4500), "Temperate Forest" = c(-100, 3500),
+    "Boreal Forest"    = c(0, 2500),    "Grassland"        = c(-100, 2500),
+    "Shrubland"        = c(-100, 2500), "Desert"           = c(-100, 1500),
+    "Savanna"          = c(-100, 3000), "Cropland"         = c(-100, 3500),
+    "Tundra"           = c(-100, 1500), "Others"           = c(-100, 4000)
+  ),
+  LAI = list(
+    "Tropical Forest"  = c(0, 8), "Temperate Forest" = c(0, 8),
+    "Boreal Forest"    = c(0, 8), "Grassland"        = c(0, 8),
+    "Shrubland"        = c(0, 8), "Desert"           = c(0, 3),
+    "Savanna"          = c(0, 8), "Cropland"         = c(0, 8),
+    "Tundra"           = c(0, 8), "Others"           = c(0, 8)
+  ),
+  SOC = list(
+    "Tropical Forest"  = c(0, 1.5), "Temperate Forest" = c(0, 1.5),
+    "Boreal Forest"    = c(0, 1.5), "Grassland"        = c(0, 1.5),
+    "Shrubland"        = c(0, 1),   "Desert"           = c(0, 0.3),
+    "Savanna"          = c(0, 0.3), "Cropland"         = c(0, 1),
+    "Tundra"           = c(0, 2),   "Others"           = c(0, 3)
+  ),
+  swc = list(
+    "Tropical Forest"  = c(0, 0.7), "Temperate Forest" = c(0, 0.7),
+    "Boreal Forest"    = c(0, 0.7), "Grassland"        = c(0, 0.7),
+    "Shrubland"        = c(0, 0.7), "Desert"           = c(0, 0.7),
+    "Savanna"          = c(0, 0.7), "Cropland"         = c(0, 0.7),
+    "Tundra"           = c(0, 0.7), "Others"           = c(0, 0.7)
+  )
+)
+Rs_env <- site_biome_sr_for_xh %>%
+  dplyr::filter(!model %in% c("yang", "SDGVM", "JSBACH", "EDv3")) %>%
+  mutate(
+    var = dplyr::case_when(
+      mtype == "Data Driven" ~ "Rs_DDMs",
+      mtype == "TRENDY"      ~ "Rs_PBMs",
+      TRUE                   ~ NA_character_
+    ),
+    value = sr
+  ) %>%
+  dplyr::filter(!is.na(var)) %>%      # 保险：去掉不属于这两类的行
+  select(
+    biome,
+    var,
+    type,      # 注意 type 仍是 site/biome，用于左右半小提琴
+    value
+  )
+var_labels <- list(
+  "AI"      = "<b>AI</b>",
+  "Tair"    = "<b>MAT<br>(\u00b0C)</b>",
+  "Pre"     = "<b>MAP<br>(mm)</b>",
+  "GPP"     = "<b>GPP<br>(g C m<sup>-2</sup>)</b>",
+  "LAI"     = "<b>LAI<br>(m<sup>2</sup> m<sup>-2</sup>)</b>",
+  "SOC"     = "<b>SOC<br>(kg C m<sup>-2</sup>)</b>",
+  "swc"     = "<b>SWC<br>(m<sup>3</sup> m<sup>-3</sup>)</b>",
+  "Rs_DDMs" = "<b>R<sub>s</sub> DDMs<br>(g C m<sup>-2</sup>)</b>",
+  "Rs_PBMs" = "<b>R<sub>s</sub> PBMs<br>(g C m<sup>-2</sup>)</b>"
+)
+rs_range <- Rs_env %>%
+  group_by(var, biome) %>%  # ← 多加一个 var 分组
+  summarise(
+    ymin = min(value, na.rm = TRUE),
+    ymax = max(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+for (v in c("Rs_DDMs", "Rs_PBMs")) {
+  sub <- rs_range %>% filter(var == v)
+  range_cfg[[v]] <- lapply(
+    split(sub, sub$biome),
+    function(x) c(
+      floor(x$ymin * 0.9),
+      ceiling(x$ymax * 1.1)
+    )
+  )
+}
+violin_data <- bind_rows(env_site %>% filter(data != "WC") %>% select(biome, var, type, value), Rs_env)
+
+# 半提琴图的配色与字号，后续其他图沿用同一套
+strip_fill <- "gray95"     # 与顶部 strip.background 一致
+col_site   <- "#4DB6AC"
+col_biome  <- "#6A1B9A"
+lab_fs     <- 10           # 与顶部 strip.text.x 的 size = 10 一致
+
+make_violin_v8 <- function(biome_pick, var_pick, filename, width, height,
+                           strip_y_size = 10) {
+  measure_file <- tempfile(fileext = ".png")
+  png(measure_file, width = 7, height = 5, units = "in", res = 96,
+      type = if (.Platform$OS.type == "windows") "windows" else "cairo")
+  measure_device <- dev.cur()
+  on.exit({ dev.off(which = measure_device); unlink(measure_file) }, add = TRUE)
+  dat <- violin_data %>% filter(biome %in% biome_pick, var %in% var_pick)
+dat$biome <- factor(dat$biome,
+                    levels = biome_pick)      # 只保留选中的几个，并按此顺序排列
+dat$var   <- factor(dat$var,
+                    levels = var_pick)   # ⭐ 把 var_names 改成 var_pick
+stats_df <- dat %>% group_by(var, biome) %>% wilcox_test(value ~ type) %>% add_significance()
+y_scales <- list()
+for (v in var_pick) {          # 外层：var（对应每一行）
+  for (b in biome_pick) {      # biome_levels内层：biome（对应每一列）
+    y_scales[[length(y_scales) + 1]] <-
+      scale_y_continuous(
+        limits = range_cfg[[v]][[b]],
+        expand = c(0, 0.15),
+        oob    = scales::squish
+      )
+  }
+}
+
+var_strip <- unlist(var_labels)
+
+get_lim <- function(v, b) {
+  r <- range_cfg[[v]][[b]]
+  if (is.null(r)) c(-Inf, Inf) else r
+}
+
+lim_df <- expand.grid(
+  var = var_pick, biome = biome_pick, stringsAsFactors = FALSE
+) %>%
+  rowwise() %>%
+  mutate(lo = get_lim(var, biome)[1], hi = get_lim(var, biome)[2]) %>%
+  ungroup()
+
+dat_violin <- dat %>%
+  mutate(var = as.character(var), biome = as.character(biome)) %>%
+  left_join(lim_df, by = c("var", "biome")) %>%
+  mutate(value = pmin(pmax(value, lo), hi)) %>%          # 步骤 1：squish
+  group_by(var, biome, type) %>%
+  mutate(
+    q1  = quantile(value, 0.25, na.rm = TRUE),
+    q3  = quantile(value, 0.75, na.rm = TRUE),
+    iqr = q3 - q1
+  ) %>%
+  filter(value >= q1 - 1.5 * iqr, value <= q3 + 1.5 * iqr) %>%   # 步骤 2：须范围
+  ungroup() %>%
+  select(biome, var, type, value) %>%
+  mutate(
+    var   = factor(var,   levels = var_pick),
+    biome = factor(biome, levels = biome_pick)
+  )
+
+
+p_main <- ggplot(dat, aes(x = "", y = value, fill = type)) +
+
+  geom_half_violin(
+    data = filter(dat_violin, type == "site"),
+    side = "l", width = 0.6, alpha = 0.5, trim = TRUE
+  ) +
+  geom_half_violin(
+    data = filter(dat_violin, type == "biome"),
+    side = "r", width = 0.6, alpha = 0.5, trim = TRUE
+  ) +
+
+  geom_half_boxplot(
+    data = ~filter(.x, type == "site"),
+    side = "l", width = 0.3, alpha = 0.9,
+    outlier.shape = NA, errorbar.draw = FALSE
+  ) +
+  geom_half_boxplot(
+    data = ~filter(.x, type == "biome"),
+    side = "r", width = 0.3, alpha = 0.9,
+    outlier.shape = NA, errorbar.draw = FALSE
+  ) +
+
+  geom_text(
+    data = stats_df,
+    aes(x = "", y = Inf, label = p.signif),
+    vjust = 1.3, size = 4.5, fontface = "bold",
+    inherit.aes = FALSE
+  ) +
+
+  scale_fill_manual(values = c(site = col_site, biome = col_biome), guide = "none") +
+
+  facet_grid2(
+    var ~ biome,
+    scales      = "free_y",
+    independent = "y",
+    labeller    = labeller(var = var_strip, biome = biome_abbr)
+  ) +
+  facetted_pos_scales(y = y_scales) +
+
+  labs(x = NULL, y = NULL) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position     = "none",
+    axis.title          = element_blank(),
+    axis.text.x         = element_blank(),
+    axis.ticks.x        = element_blank(),
+    axis.ticks.length.x = unit(0, "pt"),     # x 方向不占空间
+    axis.text.y         = element_text(size = 7),
+    panel.grid          = element_blank(),
+    strip.background    = element_rect(fill = strip_fill),
+    strip.background.y  = element_blank(),
+    strip.text.x        = element_text(face = "bold", size = 10),
+    strip.text.y        = element_markdown(face = "bold", size = 10, angle = -90),
+    panel.spacing       = unit(0.4, "lines"),
+    plot.margin         = margin(5, 5, 5, 5)
+  )
+
+p_main <- p_main + figure_theme(dense = TRUE) +
+  theme(axis.title = element_blank(), axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.length.x = unit(0, "pt"),
+        strip.background = element_rect(fill = strip_fill, colour = FIG_STYLE$ink,
+                                         linewidth = FIG_STYLE$border),
+        strip.background.y = element_blank(),
+        strip.text.x = element_text(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                     face = "bold", size = 10),
+        # strip.text.y = element_markdown(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+        #                                  face = "bold", size = 10, angle = -90))
+        strip.text.y = element_markdown(family = FIG_STYLE$family, colour = FIG_STYLE$ink,
+                                        face = "bold", size = strip_y_size, angle = -90))
+
+strip_el <- tryCatch(
+  calc_element("strip.background.x", p_main$theme),
+  error = function(e) NULL
+)
+strip_line <- if (!is.null(strip_el$colour))    strip_el$colour    else FIG_STYLE$ink
+strip_lw   <- if (!is.null(strip_el$linewidth)) strip_el$linewidth else FIG_STYLE$border
+strip_lwd  <- strip_lw * ggplot2::.pt
+
+g <- ggplotGrob(p_main)
+
+strip_top <- g$layout[grepl("^strip-t", g$layout$name), ]
+strip_h   <- g$heights[min(strip_top$t)]
+
+pan      <- g$layout[grepl("^panel", g$layout$name), ]
+last_pan <- pan[pan$t == max(pan$t), ]
+last_pan <- last_pan[order(last_pan$l), ]
+
+pos <- max(last_pan$b)
+g   <- gtable_add_rows(g, strip_h, pos = pos)
+new_row <- pos + 1
+
+make_lab <- function() {
+  gp_line <- gpar(col = strip_line, lwd = strip_lwd)
+  gTree(children = gList(
+    # site/biome 只是半小提琴的图例说明，不是新的面板：
+    # 面板背景和方框都设为透明，避免和上面的 Trf/Gra/Shr 等生物群系面板混淆。
+    # 在 site、biome 两个词正上方各画一小段竖线示意 x 轴刻度，
+    # 长度约为原来那条分隔线的三分之一。
+    rectGrob(gp = gpar(fill = NA, col = NA)),
+    segmentsGrob(x0 = 0.25, x1 = 0.25, y0 = 0.86, y1 = 1, gp = gp_line),
+    segmentsGrob(x0 = 0.75, x1 = 0.75, y0 = 0.86, y1 = 1, gp = gp_line),
+    textGrob("site",  x = 0.25, gp = gpar(col = col_site,  fontface = "bold", fontfamily = FIG_STYLE$family, fontsize = lab_fs)),
+    textGrob("biome", x = 0.75, gp = gpar(col = col_biome, fontface = "bold", fontfamily = FIG_STYLE$family, fontsize = lab_fs))
+  ))
+}
+
+for (i in seq_len(nrow(last_pan))) {
+  g <- gtable_add_grob(
+    g, make_lab(),
+    t = new_row, b = new_row,
+    l = last_pan$l[i], r = last_pan$r[i],
+    clip = "on",                       # 与顶部 strip 一致：裁切在自己的单元格内
+    name = paste0("lab-box-", i)
+  )
+}
+  ggsave(filename, g, width = width, height = height, dpi = 300)
+  invisible(g)
+}
+
+biomes_main <- c("Tropical Forest", "Grassland", "Shrubland", "Desert")
+
+violin_specs <- list(
+  list(b = biomes_main, v = c("Pre", "LAI", "Rs_DDMs", "Rs_PBMs"),
+       file = "violin_4vars_x_4biomes_Rs_V8.png", w = 8, h = 5, s = 10),
+  list(b = biomes_main, v = c("Tair", "SOC", "AI", "GPP", "swc"),
+       file = "violin_5vars_x_4biomes_Rs_V8.png", w = 8, h = 6, s = 10),
+  list(b = c("Temperate Forest", "Boreal Forest", "Savanna", "Cropland", "Tundra", "Others"),
+       v = c("AI", "Tair", "Pre", "GPP", "LAI", "SOC", "swc", "Rs_DDMs", "Rs_PBMs"),
+       file = "violin_9vars_x_6biomes_Rs_V8.png", w = 10, h = 9, s = 8)
+)
+
+for (spec in violin_specs) {
+  make_violin_v8(spec$b, spec$v, file.path("result", spec$file),
+                 spec$w, spec$h, strip_y_size = spec$s)
+}
+  
+
+```
+
+
+
+## 全球 Rs 差异的四因子岭回归贡献
+
+```{r ridge-contribution}
+pred <- env_site %>%
+  filter(type == "biome",
+         !(var %in% c("Tair", "Pre") & data == "WC")) %>%   # Tair/Pre 只留 CRU
+  mutate(value = as.numeric(value)) %>%              # 堵情况一:强制数值
+  pivot_wider(names_from = var, values_from = value,
+              id_cols = c(cell_id, x, y, biome),
+              values_fn = mean)                       # 堵情况二:同键多行取均值
+
+diff_mean_rast <- rast("data/for_xiaohua_diff_mean_rast.tif")
+rs <- c(r_dd, r_tr, diff_mean_rast); names(rs) <- c("Rs_DDM", "Rs_PBM", "dRs")
+
+pts <- vect(pred, geom = c("x", "y"), crs = crs(rs))
+df  <- bind_cols(pred, terra::extract(rs, pts)[, -1])
+
+vars4   <- c("Tair", "Pre", "LAI", "SOC")
+targets <- c("Rs_DDM", "Rs_PBM", "dRs")
+
+df_all <- df   # 保留全部预测因子，供下面的堆叠贡献图使用
+df <- df %>%
+  select(cell_id, x, y, biome, all_of(vars4), all_of(targets)) %>%
+  drop_na(all_of(c(vars4, targets)))
+
+# 对于目标因子 k，相对重要性 RC_k = |beta_k| / sum_{j=1}^4 |beta_j| * 100；
+# k 是当前柱对应的因子，j 是分母求和时遍历四个因子的哑指标（不能把两者混为同一固定下标）。
+# 相对重要性（图中柱高）= |标准化岭回归系数| / sum|标准化岭回归系数| * 100，
+# 四根柱合计 100%。R2 是模型对目标变量的总体解释力（样本内 R2，lambda 由 10 折
+# 交叉验证选出），单独标注在面板角落，不参与柱高的分配——这里不做严格的方差分解。
+run_ridge <- function(d, yname, vars){
+  d <- d %>% drop_na(all_of(c(yname, vars)))
+  if (nrow(d) < 20) return(NULL)                 # 样本过少跳过
+  X <- scale(as.matrix(mutate(d[vars],  # 在当前子集内 z-score
+                              across(everything(), as.numeric))))
+  y <- d[[yname]]
+  cv <- cv.glmnet(X, y, alpha = 0, standardize = FALSE)  # alpha=0 即 ridge
+  b  <- as.vector(coef(cv, s = "lambda.min"))[-1]
+  yhat <- as.vector(predict(cv, newx = X, s = "lambda.min"))
+  R2 <- 1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
+  tibble(var = vars, coef = b,
+         contrib = abs(b) / sum(abs(b)) * 100,
+         R2 = R2, n = nrow(d))
+}
+
+set.seed(123)
+result <- run_ridge(df, "dRs", vars4) %>% mutate(scale = "Global", target = "dRs")
+
+var_colors <- c("MAT" = "#E4211C", "MAP" = "#2E75B6",
+                "LAI" = "#4DAF4A", "SOC" = "#F28E2B")
+var_levels <- c("MAT", "MAP", "LAI", "SOC")
+
+sub_df <- result %>%
+  filter(target == "dRs", scale == "Global") %>%
+  mutate(
+    var = dplyr::recode(var, "Tair" = "MAT", "Pre" = "MAP"),
+    var = factor(var, levels = var_levels)
+  )
+
+r2_val <- unique(sub_df$R2)   # 该 scale×target 唯一的 R²
+
+p_sub <- ggplot(sub_df, aes(x = var, y = contrib, fill = var)) +
+  geom_col(width = 0.65, color = "white", linewidth = 0.25) +
+  annotate("text",
+           x     = Inf, y = Inf,
+           label = paste0("plain(R)^2 == ", sprintf("%.2f", r2_val)),
+           parse = TRUE,
+           hjust = 1.15, vjust = 1.8,
+           size  = 3.4,  color = "black") +
+  scale_fill_manual(values = var_colors) +
+  scale_y_continuous(
+    limits = c(0, NA),
+    expand = expansion(mult = c(0, 0.12))   # 顶部留白放 R² 标注
+  ) +
+  labs( x = "Drivers",
+     y = expression("Relative importance for "~Delta*R[s]~" (% )")) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),   # Modified: remove all internal grids
+    legend.position    = "none",
+    axis.text.x        = element_text(size = 10)
+  )
+```
+
+## 四因子贡献与 MAP、LAI 响应曲线（V7）
+
+```{r response-curves}
+env_biome <- env_site %>%
+  filter(type == "biome",
+         var %in% c("Tair", "Pre", "LAI", "SOC"),
+         !(var %in% c("Tair", "Pre") & data == "WC")) %>%
+  transmute(
+    x, y, biome,
+    variable = dplyr::recode(as.character(var),
+                             Tair = "temp", Pre = "pre", LAI = "lai", SOC = "soc"),
+    x_value  = as.numeric(value),
+    x_value  = if_else(variable == "soc", x_value * 100, x_value)
+  )
+
+rs_biome <- sr_site_all %>%
+  filter(type == "biome",
+         !model %in% c("yang", "SDGVM", "JSBACH", "EDv3")) %>%
+  group_by(x, y, mtype) %>%
+  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = mtype, values_from = value) %>%
+  rename(ML = `Data Driven`, LSM = `TRENDY`)
+
+all_value_4factors <- env_biome %>%
+  inner_join(rs_biome, by = c("x", "y")) %>%
+  filter(!is.na(LSM), !is.na(ML), !is.na(x_value)) %>%
+  mutate(
+    variable = factor(variable, levels = c("pre", "temp", "lai", "soc")),
+    p_tag    = factor(case_match(as.character(variable),
+                                 "pre" ~ "a", "temp" ~ "b",
+                                 "lai" ~ "c", "soc" ~ "d"),
+                      levels = c("a", "b", "c", "d"))
+  ) %>%
+  select(LSM, ML, variable, x_value, p_tag, x, y, biome)
+
+srdb_long <- srdb_v51 %>%
+  dplyr::filter(Rs_annual<3500)%>%
+  dplyr::select(temp = MAT, pre = MAP, lai = LAI, soc = C_soilmineral, Rs_annual) %>%
+  mutate(lai = if_else(lai > 7, 7, lai)) %>%
+  mutate(soc=soc/1000)%>%
+  pivot_longer(
+    cols = c(temp, pre, lai, soc),
+    names_to = "variable",
+    values_to = "x_value"
+  ) %>%
+  mutate(
+    type = "SRDB"
+  )
+var_labels <- c(
+  pre  = "MAP~(mm~yr^{-1})",
+  temp = "MAT~(degree*C)",
+  lai  = "LAI~(m^{2}~m^{-2})",
+  soc  = "SOC~(kg~C~m^{-2})"
+)
+
+bin_cfg <- tribble(
+  ~series, ~variable, ~k,  ~tail,
+  "PBMs",  "pre",     100,  1,
+  "PBMs",  "lai",     100,  2.5,
+  "DDMs",  "pre",     100,  1,
+  "DDMs",  "lai",     100,  2.5,
+  "SRDB",  "pre",     30,  1,
+  "SRDB",  "lai",     29,  2.5
+)
+
+pt_size  <- 0.25   # 三条线统一; 实际点径 = 0.25 × 4 = 1.0
+ln_width <- 0.35   # 三条线统一的误差棒线宽
+
+col_map <- c("PBMs" = "#440154", "DDMs" = "#21908C", "SRDB" = "#D95F02")
+
+model_long <- all_value_4factors %>%
+  filter(variable %in% c("pre", "lai")) %>%
+  mutate(variable = as.character(variable)) %>%
+  select(variable, x_value, PBMs = LSM, DDMs = ML) %>%
+  pivot_longer(c(PBMs, DDMs), names_to = "series", values_to = "y")
+
+srdb_2 <- srdb_long %>%
+  filter(variable %in% c("pre", "lai")) %>%
+  mutate(variable = as.character(variable)) %>%
+  select(variable, x_value, y = Rs_annual) %>%
+  mutate(series = "SRDB")
+
+lai_rng <- model_long %>%
+  filter(variable == "lai") %>%
+  summarise(lo = min(x_value, na.rm = TRUE),
+            hi = max(x_value, na.rm = TRUE))
+
+n_before <- sum(srdb_2$variable == "lai" & is.finite(srdb_2$x_value))
+srdb_2 <- srdb_2 %>%
+  filter(!(variable == "lai" & (x_value < lai_rng$lo | x_value > lai_rng$hi)))
+n_after  <- sum(srdb_2$variable == "lai" & is.finite(srdb_2$x_value))
+
+message("LAI SRDB 站点 ", n_before, " -> ", n_after,
+        "(剔除 ", n_before - n_after, " 个超出 [",
+        round(lai_rng$lo, 2), ", ", round(lai_rng$hi, 2), "] 的点)")
+
+dat_all <- bind_rows(model_long, srdb_2) %>%
+  filter(is.finite(x_value), is.finite(y))
+
+bin_eqfreq <- function(x, k, tail = 1) {
+  p <- seq(0, 1, length.out = k + 1)
+  if (tail != 1) {
+    p <- ifelse(p < 0.5,
+                0.5 * (2 * p)^tail,
+                1 - 0.5 * (2 * (1 - p))^tail)
+  }
+  br <- unique(quantile(x, probs = p, na.rm = TRUE))
+  if (length(br) < 2) return(rep(1L, length(x)))
+  cut(x, breaks = br, include.lowest = TRUE, labels = FALSE)
+}
+
+binned_all <- dat_all %>%
+  left_join(bin_cfg, by = c("series", "variable")) %>%
+  group_by(series, variable) %>%
+  mutate(bin = bin_eqfreq(x_value, k = k[1], tail = tail[1])) %>%
+  group_by(series, variable, bin) %>%
+  summarise(x    = median(x_value),          # 尾部箱很宽, median 比 mean 稳
+            n    = n(),
+            mu   = mean(y),
+            y_sd = sd(y),
+            y_se = sd(y) / sqrt(n()),
+            .groups = "drop") %>%
+  mutate(y_sd = coalesce(y_sd, 0),
+         y_se = coalesce(y_se, 0)) %>%
+  mutate(variable = factor(variable, levels = c("pre", "lai")),
+         series   = factor(series,   levels = c("DDMs", "PBMs", "SRDB")))
+
+make_panel <- function(var, err = c("SE", "SD"), legend = TRUE) {
+
+  err <- match.arg(err)
+
+  d <- binned_all %>%
+    filter(variable == var) %>%
+    mutate(e    = if (err == "SE") y_se else y_sd,
+           ymin = mu - e,
+           ymax = mu + e)
+
+  ggplot(d, aes(x = x, y = mu, ymin = ymin, ymax = ymax, color = series)) +
+
+    geom_pointrange(shape = 16, size = pt_size, linewidth = ln_width) +
+
+    scale_color_manual(values = col_map,
+                       breaks = c("DDMs", "PBMs", "SRDB"), name = NULL) +
+
+    labs(x = parse(text = var_labels[[var]])[[1]],
+         y = expression(R[s] ~ (gC ~ m^{-2} ~ yr^{-1}))) +
+
+    theme_bw() +
+    theme(
+      panel.grid           = element_blank(),
+      axis.title.x         = element_text(size = 10),
+      legend.position      = if (legend) c(0.01, 0.99) else "none",
+      legend.justification = c(0, 1),
+      legend.background    = element_blank(),
+      legend.key           = element_blank())
+}
+
+p_map <- make_panel("pre", "SE")   # b
+p_lai <- make_panel("lai", "SE")   # c
+
+theme_common <- figure_theme() + theme(
+  plot.margin = margin(t = 5, r = 5, b = 5, l = 5, unit = "pt"),  # 重点：底部留更多空间
+  axis.title.y = element_text(size = FIG_STYLE$title, margin = margin(r = 5, unit = "pt"))
+)
+
+# ggplot2 按文本外框放置 x 轴标题：纯文本 "Drivers" 与含括号和上标的 plotmath
+# 标题（MAP (mm yr-1)、LAI (m2 m-2)）外框高度不同，因此不会落在同一条基线上。
+# 这里分别给三个面板设置 vjust（Arial 12 pt 下实测），让三条 x 轴标题对齐到
+# 同一条水平线上。改动 x 轴标题文字后需要重新标定这两个数值。
+theme_x_title <- function(vjust) {
+  theme(axis.title.x = element_text(size = FIG_STYLE$title, vjust = vjust,
+                                    margin = margin(t = 5, unit = "pt")))
+}
+
+p_sub_new <- p_sub + theme_common + theme_x_title(0.30)
+p_map_new <- p_map + theme_common + theme_x_title(0)
+p_lai_new <- p_lai + theme_common + theme_x_title(0)
+
+p_all <- p_sub_new + p_map_new + p_lai_new +
+  plot_layout(nrow = 1, widths = c(1, 1, 1)) +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = FIG_STYLE$tag, face = "bold"))  # 4mm -> pt, 和原来 geom_text(size=4) 等大
+
+p_all
+
+
+ggsave("result/Rs_RC_SE_2factors_V7.png", p_all, width = 9, height = 4, dpi = 300, bg = "white")
+```
+
+## 四因子相对贡献堆叠图：DDMs 与 PBMs（全球 + Trf/Gra/Shr/Des，V1）
+
+```{r contribution-stack}
+# 对于目标因子 k，每根柱子的相对贡献 RC_k = |beta_k| /
+# sum_{j=1}^4 |beta_j|；k 指当前因子，j 遍历四个因子。因此每根柱子合计 100%。
+# 预测因子在 ridge_stack_vars 里一处定义：MAT / MAP / LAI / SOC。
+ridge_stack_vars   <- c("Tair", "Pre", "LAI", "SOC")      # MAT, MAP, LAI, SOC
+ridge_stack_labels <- c(Tair = "MAT", Pre = "MAP", LAI = "LAI", SOC = "SOC")
+ridge_stack_levels <- c("Glo", "Trf", "Gra", "Shr", "Des")
+ridge_stack_biomes <- list(
+  Glo = NULL,
+  Trf = "Tropical Forest",
+  Gra = "Grassland",
+  Shr = "Shrubland",
+  Des = "Desert"
+)
+ridge_stack_colors <- c(MAT = "#E4211C", MAP = "#2E75B6",
+                        LAI = "#4DAF4A", SOC = "#F28E2B")
+ridge_stack_targets <- c(Rs_DDM = "DDMs", Rs_PBM = "PBMs")
+
+stack_df <- df_all %>%
+  select(biome, all_of(ridge_stack_vars), all_of(names(ridge_stack_targets))) %>%
+  drop_na()
+
+stack_res <- bind_rows(lapply(names(ridge_stack_biomes), function(g) {
+  sub <- if (is.null(ridge_stack_biomes[[g]])) {
+    stack_df
+  } else {
+    stack_df %>% filter(biome == ridge_stack_biomes[[g]])
+  }
+  bind_rows(lapply(names(ridge_stack_targets), function(tg) {
+    r <- run_ridge(sub, tg, ridge_stack_vars)
+    if (is.null(r)) return(NULL)
+    r %>% mutate(group = g, target = unname(ridge_stack_targets[[tg]]))
+  }))
+}))
+
+stack_res <- stack_res %>%
+  mutate(
+    var    = factor(unname(ridge_stack_labels[as.character(var)]),
+                     levels = c("MAT", "MAP", "LAI", "SOC")),
+    group  = factor(group, levels = ridge_stack_levels),
+    target = factor(target, levels = c("DDMs", "PBMs"))
+  )
+
+stack_r2 <- stack_res %>% distinct(group, target, R2)
+
+make_stack_panel <- function(target_name) {
+  d  <- stack_res %>% filter(target == target_name)
+  r2 <- stack_r2  %>% filter(target == target_name)
+
+  ggplot(d, aes(x = group, y = contrib, fill = var)) +
+    geom_col(width = 0.68, color = "white", linewidth = 0.25,
+             position = position_stack(reverse = TRUE)) +
+    # R2 是模型对目标变量的整体解释力，与纵轴的相对重要性百分比是两个量，
+    # 因此单独标注在面板角落，不放进 y 轴。
+    geom_text(data = r2,
+              aes(x = group, y = 104.5, label = sprintf("R^2 == '%.2f'", R2)),
+              color = "black", fontface = "bold", size = 3.2,
+              parse = TRUE, inherit.aes = FALSE) +
+    scale_fill_manual(values = ridge_stack_colors, name = NULL) +
+    scale_y_continuous(limits = c(0, 110), expand = c(0, 0)) +
+    labs(x = NULL, y = "Relative importance (% )") +
+    theme_bw(base_size = 11) +
+    theme(panel.grid = element_blank())
+}
+
+p_stack_ddm <- make_stack_panel("DDMs") + figure_theme() +
+  labs(title = "DDMs") +
+  theme(legend.position = "bottom", legend.key.size = unit(3.5, "mm"),
+        plot.margin = margin(5, 5, 5, 5))
+p_stack_pbm <- make_stack_panel("PBMs") + figure_theme() +
+  labs(title = "PBMs") +
+  theme(legend.position = "bottom", legend.key.size = unit(3.5, "mm"),
+        plot.margin = margin(5, 5, 5, 5),
+        axis.title.y = element_blank())
+
+p_stack <- (p_stack_ddm | p_stack_pbm) +
+  plot_layout(nrow = 1, guides = "collect") +
+  plot_annotation(tag_levels = "a") &
+  theme(plot.tag = element_text(size = FIG_STYLE$tag, face = "bold"),
+        legend.position = "bottom")
+
+ggsave("result/Rs_contrib_stack_2models_V1.png", p_stack,
+       width = 9, height = 4.5, dpi = 300, bg = "white")
+```
+
+## 各模式土壤呼吸在四个生物群系的分布（DDMs / PBMs，V1）
+
+```{r model-biome-boxplots}
+# 配色与半提琴图一致：site 用青色、biome 用紫色；
+# x 轴按 DDMs -> PBMs 排列，并剔除 yang / SDGVM / JSBACH / EDv3。
+model_ddm_semi <- c("raich02", "raich95", "hash12", "hash15")
+model_ddm_ml   <- c("Huang", "Lu", "stell", "Warner", "Zhao")
+model_ddm_tail <- "Tang"
+model_pbm      <- c("CABLE-POP", "CLASSIC", "CLM6.0", "E3SM", "IBIS",
+                    "iMAPLE", "ISAM", "JULES", "LPJmL", "VISIT", "visit-ut")
+model_order   <- c(model_ddm_semi, model_ddm_ml, model_ddm_tail, model_pbm)
+model_index   <- setNames(seq_along(model_order), model_order)
+# 三条分隔线：hash15 | Huang（虚线）、Zhao | Tang（虚线）、
+#              Tang | CABLE-POP（实线，即 DDMs 与 PBMs 的分界）
+model_sep_dashed <- c(length(model_ddm_semi) + 0.5,
+                       length(model_ddm_semi) + length(model_ddm_ml) + 0.5)
+model_sep_solid   <- length(model_ddm_semi) + length(model_ddm_ml) + 1.5
+biome_four    <- c("Tropical Forest", "Grassland", "Shrubland", "Desert")
+
+model_df <- sr_site_all %>%
+  filter(type %in% c("biome", "site"), biome %in% biome_four) %>%
+  filter(!is.na(value)) %>%
+  transmute(
+    biome     = factor(biome, levels = biome_four),
+    type      = factor(type, levels = c("site", "biome")),
+    model     = factor(model, levels = model_order),
+    model_idx = unname(model_index[as.character(model)]),
+    value     = as.numeric(value)
+  ) %>%
+  filter(!is.na(model_idx)) %>%
+  # site 在左、biome 在右，与半提琴图左右半边一致
+  mutate(x_pos = model_idx + ifelse(type == "site", -0.19, 0.19))
+
+# 分组标注：第一行是 DDMs / PBMs 大类，第二行是 Semi-empirical / ML，
+# 第三行是 (Vegetation)（比第二行略低）。
+model_annot <- tribble(
+  ~x,    ~label,           ~hjust, ~size, ~face,  ~dy,
+  5.5,   "DDMs",           0.5,   4.3,  "bold", 0.300,
+  16,    "PBMs",           0.5,   4.3,  "bold", 0.300,
+  2.5,   "Semi-empirical", 0.5,   3.4,  "plain", 0.150,
+  7,     "ML",             0.5,   3.4,  "plain", 0.150,
+  7,     "(Vegetation)",   0.5,   3.4,  "plain", 0.010
+) %>%
+  tidyr::crossing(biome = biome_four) %>%
+  mutate(biome = factor(biome, levels = biome_four)) %>%
+  left_join(model_df %>% group_by(biome) %>%
+              summarise(ymin = min(value), ymax = max(value), .groups = "drop"),
+            by = "biome") %>%
+  mutate(y = ymax + dy * (ymax - ymin))
+
+p_model <- ggplot(model_df,
+                   aes(x = x_pos, y = value,
+                       group = interaction(model, type), fill = type)) +
+  geom_boxplot(width = 0.36, outlier.shape = NA, linewidth = 0.3, colour = "black") +
+  geom_vline(xintercept = model_sep_dashed, linetype = "dashed",
+             colour = "grey30", linewidth = 0.4) +
+  geom_vline(xintercept = model_sep_solid, colour = "black", linewidth = 0.5) +
+  geom_text(data = model_annot,
+            aes(x = x, y = y, label = label, size = size, fontface = face, hjust = hjust),
+            inherit.aes = FALSE, colour = "black", family = FIG_STYLE$family) +
+  scale_size_identity() +
+  scale_x_continuous(breaks = seq_along(model_order), labels = model_order,
+                     expand = expansion(add = 0.6)) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.40))) +
+  scale_fill_manual(values = c(site = col_site, biome = col_biome), name = "type") +
+  facet_wrap(~biome, ncol = 1, scales = "free_y", strip.position = "top",
+             labeller = labeller(biome = biome_abbr)) +
+  labs(x = "model", y = expression(R[s] ~ (gC ~ m^{-2} ~ yr^{-1}))) +
+  figure_theme() +
+  theme(
+    axis.text.x    = element_text(angle = 45, hjust = 1),
+    axis.title.y   = element_text(size = FIG_STYLE$title, margin = margin(r = 14, unit = "pt")),
+    legend.position = "top",
+    legend.title   = element_text(size = FIG_STYLE$legend, face = "bold"),
+    panel.grid     = element_blank(),
+    strip.background = element_rect(fill = "gray95", colour = FIG_STYLE$ink,
+                                    linewidth = FIG_STYLE$border),
+    plot.margin    = margin(5, 5, 5, 5)
+  )
+
+ggsave("result/Rs_model_biome_boxplots_V1.png", p_model,
+       width = 11, height = 9, dpi = 300, bg = "white")
+```
+
+## 三个 NetCDF：DDM 土壤呼吸、PBMs 土壤呼吸、环境变量与生物群系
+
+```{r netcdf}
+# 三个 NetCDF 及其同名变量表统一输出到 result/zenodo/，该目录内容用于上传 Zenodo
+out_dir <- file.path("result", "zenodo")
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+as_number <- function(x) suppressWarnings(as.numeric(as.character(x)))
+
+safe_nc_names <- function(x) {
+  y <- iconv(as.character(x), to = "ASCII//TRANSLIT")
+  y[is.na(y)] <- "variable"
+  y <- gsub("[^A-Za-z0-9_]", "_", y)
+  y <- gsub("_+", "_", y)
+  y <- sub("^([^A-Za-z_])", "v_\\1", y)
+  y <- ifelse(nchar(y) == 0, "variable", y)
+  make.unique(y, sep = "_")
+}
+
+align_to_ref <- function(r, ref, method = "bilinear") {
+  same_crs <- tryCatch(terra::same.crs(r, ref), error = function(e) FALSE)
+  if (!same_crs) {
+    r <- terra::project(r, ref, method = method)
+  } else if (!terra::compareGeom(r, ref, stopOnError = FALSE)) {
+    r <- terra::resample(r, ref, method = method)
+  }
+  r
+}
+
+lsm_all <- terra::rast("data/for_xiaohua_lsm_stack.tif")
+ml_all  <- terra::rast("data/for_xiaohua_ml_stack.tif")
+drop_models <- c("yang", "SDGVM", "JSBACH", "EDv3")
+is_dropped <- function(nm) vapply(nm, function(z)
+  any(vapply(drop_models, function(d) grepl(d, z, ignore.case = TRUE), logical(1))),
+  logical(1))
+lsm_use <- lsm_all[[which(!is_dropped(names(lsm_all)))]]
+ml_use  <- ml_all [[which(!is_dropped(names(ml_all)))]]
+if (nlyr(lsm_use) != 11L || nlyr(ml_use) != 10L) {
+  stop("Expected 11 PBM and 10 DDM layers after filtering; got ",
+       nlyr(lsm_use), " PBM and ", nlyr(ml_use), " DDM layers.")
+}
+ref_grid <- ml_use[[1]]
+lsm_use <- align_to_ref(lsm_use, ref_grid)
+ml_use  <- align_to_ref(ml_use, ref_grid)
+
+env_map <- data.frame(
+  source = c("Tair", "Pre", "LAI", "SOC", "GPP", "AI", "swc"),
+  name   = c("MAT", "MAP", "LAI", "SOC", "GPP", "AI", "SWC"),
+  units  = c("degC", "mm yr-1", "m2 m-2", "kg C m-2", "g C m-2 yr-1", "1", "m3 m-3"),
+  stringsAsFactors = FALSE
+)
+if (!exists("env_site") || !all(c("x", "y", "var", "value", "type") %in% names(env_site))) {
+  stop("env_site is not available or lacks x, y, var, value and type columns.")
+}
+env_df <- env_site %>%
+  filter(type == "biome", var %in% env_map$source,
+         !(var %in% c("Tair", "Pre") & data == "WC")) %>%
+  transmute(x = as_number(x), y = as_number(y), var = as.character(var),
+            value = as_number(value)) %>%
+  filter(is.finite(x), is.finite(y), is.finite(value)) %>%
+  group_by(x, y, var) %>%
+  summarise(value = mean(value), .groups = "drop") %>%
+  mutate(value = if_else(var == "SOC", value * 100, value))
+
+env_list <- list()
+for (i in seq_len(nrow(env_map))) {
+  src <- env_map$source[i]
+  sub <- env_df %>% filter(var == src) %>% select(x, y, value)
+  if (!nrow(sub)) {
+    warning("No values found for environmental variable ", src, "; it is omitted.")
+    next
+  }
+  r <- terra::rast(sub, type = "xyz", crs = terra::crs(ref_grid))
+  r <- align_to_ref(r, ref_grid, method = "bilinear")
+  names(r) <- env_map$name[i]
+  env_list[[env_map$name[i]]] <- r
+}
+if (!length(env_list)) stop("No environmental layers could be built from env_site.")
+env_stack <- do.call(c, unname(env_list))
+
+biome_levels <- c("Tropical Forest", "Temperate Forest", "Boreal Forest",
+                  "Grassland", "Shrubland", "Desert", "Savanna",
+                  "Cropland", "Tundra", "Others")
+biome_df <- env_site %>%
+  filter(type == "biome", !is.na(biome), biome != "") %>%
+  transmute(x = as_number(x), y = as_number(y), biome = as.character(biome)) %>%
+  filter(is.finite(x), is.finite(y)) %>%
+  group_by(x, y) %>% slice(1L) %>% ungroup() %>%
+  mutate(biome_code = match(biome, biome_levels)) %>%
+  filter(!is.na(biome_code))
+if (!nrow(biome_df)) stop("No biome grid cells could be built from env_site.")
+r_biome <- terra::rast(biome_df %>% select(x, y, biome_code),
+                       type = "xyz", crs = terra::crs(ref_grid))
+r_biome <- align_to_ref(r_biome, ref_grid, method = "near")
+names(r_biome) <- "biome_code"
+
+pbm_source <- names(lsm_use)
+ddm_source <- names(ml_use)
+env_source <- env_map$name[env_map$name %in% names(env_stack)]
+
+# 输出拆成三个文件：DDM 土壤呼吸、PBMs 土壤呼吸、环境变量 + 生物群系
+nc_env <- safe_nc_names(c("biome_code", env_source))
+nc_pbm <- safe_nc_names(paste0("Rs_PBM_", pbm_source))
+nc_ddm <- safe_nc_names(paste0("Rs_DDM_", ddm_source))
+if (anyDuplicated(c(nc_env, nc_pbm, nc_ddm))) {
+  stop("NetCDF variable names are not unique across the three files.")
+}
+
+names(r_biome)   <- nc_env[1]
+names(env_stack) <- nc_env[seq_len(nlyr(env_stack)) + 1L]
+names(lsm_use)   <- nc_pbm
+names(ml_use)    <- nc_ddm
+
+env_biome_stack <- c(r_biome, env_stack)
+pbm_stack <- lsm_use
+ddm_stack <- ml_use
+
+meta_env <- data.frame(
+  nc_name = names(env_biome_stack),
+  source_name = c("biome_code", env_source),
+  long_name = c(
+    "Biome / landcover type (1-10 code)",
+    paste0(env_source, " global product")
+  ),
+  units = c("categorical", env_map$units[match(env_source, env_map$name)]),
+  group = c("biome", rep("env_factor", nlyr(env_stack))),
+  stringsAsFactors = FALSE
+)
+meta_pbm <- data.frame(
+  nc_name = names(pbm_stack),
+  source_name = pbm_source,
+  long_name = paste0("Soil respiration from PBM ", pbm_source),
+  units = rep("g C m-2 yr-1", nlyr(pbm_stack)),
+  group = rep("model_PBM", nlyr(pbm_stack)),
+  stringsAsFactors = FALSE
+)
+meta_ddm <- data.frame(
+  nc_name = names(ddm_stack),
+  source_name = ddm_source,
+  long_name = paste0("Soil respiration from DDM ", ddm_source),
+  units = rep("g C m-2 yr-1", nlyr(ddm_stack)),
+  group = rep("model_DDM", nlyr(ddm_stack)),
+  stringsAsFactors = FALSE
+)
+
+add_meta_stats <- function(meta_df, stack) {
+  meta_df$n_valid <- vapply(seq_len(nlyr(stack)), function(i)
+    sum(!is.na(terra::values(stack[[i]]))), numeric(1))
+  meta_df$min <- vapply(seq_len(nlyr(stack)), function(i)
+    suppressWarnings(min(terra::values(stack[[i]]), na.rm = TRUE)), numeric(1))
+  meta_df$max <- vapply(seq_len(nlyr(stack)), function(i)
+    suppressWarnings(max(terra::values(stack[[i]]), na.rm = TRUE)), numeric(1))
+  meta_df
+}
+meta_env <- add_meta_stats(meta_env, env_biome_stack)
+meta_pbm <- add_meta_stats(meta_pbm, pbm_stack)
+meta_ddm <- add_meta_stats(meta_ddm, ddm_stack)
+
+write_nc_stack <- function(path, stack, meta_df, title, var_atts = list()) {
+  lon <- terra::xFromCol(ref_grid, seq_len(ncol(ref_grid)))
+  lat <- terra::yFromRow(ref_grid, seq_len(nrow(ref_grid)))
+  dlon <- ncdf4::ncdim_def("lon", "degrees_east", lon)
+  dlat <- ncdf4::ncdim_def("lat", "degrees_north", rev(lat))
+  vars <- lapply(seq_len(nrow(meta_df)), function(i)
+    ncdf4::ncvar_def(meta_df$nc_name[i], meta_df$units[i], list(dlon, dlat), -9999,
+                     longname = meta_df$long_name[i], prec = "float", compression = 4))
+  nc <- ncdf4::nc_create(path, vars, force_v4 = TRUE)
+  on.exit(ncdf4::nc_close(nc))
+  for (i in seq_len(nrow(meta_df))) {
+    z <- terra::as.matrix(stack[[i]], wide = TRUE)
+    stopifnot(all(dim(z) == c(nrow(ref_grid), ncol(ref_grid))))
+    z <- t(z[nrow(z):1, , drop = FALSE])
+    ncdf4::ncvar_put(nc, vars[[i]], z)
+    if (meta_df$nc_name[i] %in% names(var_atts)) {
+      for (nm in names(var_atts[[meta_df$nc_name[i]]])) {
+        att_value <- var_atts[[meta_df$nc_name[i]]][[nm]]
+        if (nm == "flag_values") {
+          ncdf4::ncatt_put(nc, meta_df$nc_name[i], nm, att_value, prec = "integer")
+        } else {
+          ncdf4::ncatt_put(nc, meta_df$nc_name[i], nm, att_value)
+        }
+      }
+    }
+  }
+  ncdf4::ncatt_put(nc, 0, "title", title)
+  invisible(path)
+}
+
+nc_outputs <- list(
+  list(nc = "RsBias_DDM_soil_respiration.nc",
+       stack = ddm_stack, meta = meta_ddm,
+       title = "Global soil respiration from data-driven models (DDMs)",
+       atts = list()),
+  list(nc = "RsBias_PBM_soil_respiration.nc",
+       stack = pbm_stack, meta = meta_pbm,
+       title = "Global soil respiration from process-based models (PBMs)",
+       atts = list()),
+  list(nc = "RsBias_env_biome.nc",
+       stack = env_biome_stack, meta = meta_env,
+       title = "Global environmental factors and biome",
+       atts = list(biome_code = list(
+         flag_values = seq_along(biome_levels),
+         flag_meanings = paste(gsub(" ", "_", biome_levels), collapse = " ")
+       )))
+)
+
+for (o in nc_outputs) {
+  write_nc_stack(file.path(out_dir, o$nc), o$stack, o$meta, o$title, o$atts)
+  write.csv(o$meta,
+            file.path(out_dir, sub("\\.nc$", "_variables.csv", o$nc)),
+            row.names = FALSE)
+}
+
+# 旧的合并文件不再输出
+for (f in file.path(out_dir, c("RsBias_global_combined.nc",
+                               "RsBias_global_combined_variables.csv"))) {
+  if (file.exists(f)) file.remove(f)
+}
+```
+
+## 输出完整性与 NetCDF 回读核对
+
+```{r verify}
+expected_png <- c("site_distribution_map_V2.png", "Rs_scatter_V3.png", "bar_4Figs_v7.png",
+ "Rs_RC_SE_2factors_V7.png", "Rs_contrib_stack_2models_V1.png",
+ "Rs_model_biome_boxplots_V1.png",
+ "violin_4vars_x_4biomes_Rs_V8.png", "violin_5vars_x_4biomes_Rs_V8.png",
+ "violin_9vars_x_6biomes_Rs_V8.png", "Fig_bias_EC_combined_V4.png", "p_dd_tr.png",
+ "Fig_rel_val_ba_V2.png")
+stopifnot(all(file.exists(file.path("result", expected_png))))
+
+expected_nc <- vapply(nc_outputs, function(o) o$nc, character(1))
+expected_csv <- sub("\\.nc$", "_variables.csv", expected_nc)
+stopifnot(all(file.exists(file.path(out_dir, expected_nc))))
+stopifnot(all(file.exists(file.path(out_dir, expected_csv))))
+
+verify_one_nc <- function(o) {
+  nc <- ncdf4::nc_open(file.path(out_dir, o$nc))
+  on.exit(ncdf4::nc_close(nc))
+  stopifnot(identical(names(nc$var), o$meta$nc_name),
+            length(nc$var) == nrow(o$meta))
+  expected_lon <- xFromCol(ref_grid, seq_len(ncol(ref_grid)))
+  expected_lat <- rev(yFromRow(ref_grid, seq_len(nrow(ref_grid))))
+  stopifnot(isTRUE(all.equal(as.numeric(nc$dim$lon$vals), expected_lon)),
+            isTRUE(all.equal(as.numeric(nc$dim$lat$vals), expected_lat)))
+  for (i in seq_len(nrow(o$meta))) {
+    expected <- t(terra::as.matrix(o$stack[[i]], wide = TRUE)[nrow(ref_grid):1, , drop = FALSE])
+    actual <- ncdf4::ncvar_get(nc, o$meta$nc_name[i])
+    stopifnot(identical(dim(actual), dim(expected)), identical(is.na(actual), is.na(expected)))
+    ok <- is.finite(expected)
+    stopifnot(all(abs(actual[ok] - expected[ok]) <= 1e-6 * pmax(1, abs(expected[ok]))))
+  }
+  invisible(TRUE)
+}
+verify_netcdf <- function() {
+  for (o in nc_outputs) verify_one_nc(o)
+  invisible(TRUE)
+}
+verify_netcdf()
+message("Verified: ", length(expected_png), " PNG figures, ",
+        length(expected_nc), " NetCDF files and their metadata CSV files.")
+```
