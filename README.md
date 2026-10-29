@@ -15,14 +15,13 @@ Bond-Lamberty, B. *Global agreement masks regional divergence in soil respiratio
 | `RsBias.Rmd` | the complete analysis: all 12 figures and all data products |
 | `data/` | inputs; provenance and SHA-256 in `data/input_manifest.csv` |
 | `result/*.png` | 12 figures (Figs. 1-4 and extended data) |
-| `result/zenodo/` | 3 NetCDF files + 3 metadata CSV tables (Zenodo deposit) |
-| `code_provenance.csv` | mapping of each chunk to its source in the original scripts |
+| `result/zenodo/` | Zenodo deposit: 3 NetCDF files, 3 metadata CSV tables, the Hashimoto source table and the supplementary material |
 
 ## Data availability
 
 The code is on GitHub; the data are on Zenodo
 ([10.5281/zenodo.23333448](https://doi.org/10.5281/zenodo.23333448)), which holds both
-the six products in `result/zenodo/` and the input data in `data/`. Please cite the
+the products in `result/zenodo/` and the input data in `data/`. Please cite the
 Zenodo DOI for the data.
 
 ## Requirements
