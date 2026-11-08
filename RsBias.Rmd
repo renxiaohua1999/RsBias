@@ -11,6 +11,7 @@ output:
 ## 运行设置与原始数据
 
 ```{r setup}
+
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE,
                       error = FALSE, dev = "png", fig.path = "result/report_figures/")
 # GDAL 默认按内存比例分配块缓存；面向 21600 x 43200 的大栅格(例如 stell/Warner)会把缓存撑爆并使拉中失败。
@@ -416,7 +417,7 @@ p_tr <- p_tr + figure_theme()
 p_lat <- p_lat + figure_theme()
 p_glo_map_Rs <- ((p_dd / p_tr) | p_lat) +
   plot_layout(widths = c(3, 1)) +
-  plot_annotation(tag_levels = "a") &
+  plot_annotation(tag_levels = "A") &
   theme(
   panel.grid        = element_blank(),   # ← 关键：去掉所有网格线
   plot.tag          = element_text(size = 14, face = "bold"),
@@ -911,7 +912,7 @@ p_biome_mean <- p_biome_mean + figure_theme(border = FALSE) +
         axis.title.y = element_blank())
 final_plot_matrix <- p_glo_Rs + p_biome_mean + p_lat_diff_3 + p_diff_2 +
   plot_layout(design = layout_design) +
-  plot_annotation(tag_levels = list(c("a", "b", "c", "d"))) & # 👈 注意：这里改用 & 符号
+  plot_annotation(tag_levels = list(c("A", "B", "C", "D"))) & # 👈 注意：这里改用 & 符号
   theme(
     plot.margin = margin(t = 0, r = 5, b = 0, l = 0, unit = "pt"),
     plot.tag = element_text(face = "bold", size = 14)
@@ -1194,7 +1195,7 @@ p_bias <- p_bias + figure_theme()
 p_both <- p_both + figure_theme()
 combined <- p_bias + p_both +   # 即使前面去掉了也没关系
   plot_layout(widths = c(0.8, 1)) +
-  plot_annotation(tag_levels = "a") &
+  plot_annotation(tag_levels = "A") &
   theme(
     panel.border = element_figure_frame(colour = "black", fill = NA, linewidth = FIG_STYLE$border),
     panel.grid = element_blank(),    # Modified: remove all internal grids
@@ -1266,7 +1267,7 @@ p_rel <- ggplot(model_df, aes(x_site, y_global)) +
   coord_cartesian(xlim = c(xlo, xhi), ylim = c(ylo, 900), clip = "off") +
   labs(x = expression("Site-level averaged R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
        y = expression("Global averaged R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
-       title = "a  Emergent relationship", subtitle = "PBMs (TRENDY)") +
+       title = "A  Emergent relationship", subtitle = "PBMs (TRENDY)") +
   theme_bw(base_size = 14) +
   theme(panel.grid.minor = element_blank(),
         plot.title = element_text(face = "bold"),
@@ -1294,7 +1295,7 @@ p_val <- ggplot(loo_df, aes(obs, pred)) +
   coord_equal(xlim = lim, ylim = lim) +
   labs(x = expression("Actual global average R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
        y = expression("LOO predicted R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
-       title = "b  Leave-one-out cross-validation", subtitle = "PBMs (TRENDY)") +
+       title = "B  Leave-one-out cross-validation", subtitle = "PBMs (TRENDY)") +
   theme_bw(base_size = 11) +
   theme(panel.grid.minor = element_blank(),
         plot.title = element_text(face = "bold"),
@@ -1327,7 +1328,7 @@ p_ba <- ggplot(dens, aes(x, y, colour = grp)) +
   coord_cartesian(xlim = x_rng, ylim = c(0, max(peak$y)*1.22)) +
   labs(x = expression("Global average R"[s]*" (g C m"^{-2}*" yr"^{-1}*")"),
        y = "Probability density",
-       title = "c  Unconstrained vs. constrained", subtitle = "PBMs (TRENDY)") +
+       title = "C  Unconstrained vs. constrained", subtitle = "PBMs (TRENDY)") +
   theme_bw(base_size = 11) +
   theme(panel.grid.minor = element_blank(), legend.position = "none",
         plot.title = element_text(face = "bold"),
@@ -2027,7 +2028,7 @@ p_lai_new <- p_lai + theme_common + theme_x_title(0)
 
 p_all <- p_sub_new + p_map_new + p_lai_new +
   plot_layout(nrow = 1, widths = c(1, 1, 1)) +
-  plot_annotation(tag_levels = "a") &
+  plot_annotation(tag_levels = "A") &
   theme(plot.tag = element_text(size = FIG_STYLE$tag, face = "bold"))  # 4mm -> pt, 和原来 geom_text(size=4) 等大
 
 p_all
@@ -2115,7 +2116,7 @@ p_stack_pbm <- make_stack_panel("PBMs") + figure_theme() +
 
 p_stack <- (p_stack_ddm | p_stack_pbm) +
   plot_layout(nrow = 1, guides = "collect") +
-  plot_annotation(tag_levels = "a") &
+  plot_annotation(tag_levels = "A") &
   theme(plot.tag = element_text(size = FIG_STYLE$tag, face = "bold"),
         legend.position = "bottom")
 
@@ -2203,8 +2204,8 @@ p_model <- ggplot(model_df,
     plot.margin    = margin(5, 5, 5, 5)
   )
 
-ggsave("result/Rs_model_biome_boxplots_V1.png", p_model,
-       width = 11, height = 9, dpi = 300, bg = "white")
+# ggsave("result/Rs_model_biome_boxplots_V1.png", p_model,
+#        width = 11, height = 9, dpi = 300, bg = "white")
 ```
 
 ## 三个 NetCDF：DDM 土壤呼吸、PBMs 土壤呼吸、环境变量与生物群系
